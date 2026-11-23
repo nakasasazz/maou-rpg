@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>maou-rpg v0.1</title>
+<style>
+  body { background:#101018; color:#f0ead6; font-family:"Hiragino Kaku Gothic ProN",sans-serif; text-align:center; margin:0; padding:12px; }
+  h1 { font-size:18px; margin:4px 0; letter-spacing:2px; }
+  #hud { font-size:15px; margin:6px auto; background:#1d1d2b; border:2px solid #555; display:inline-block; padding:6px 14px; border-radius:6px; }
+  #hud span { margin:0 7px; }
+  canvas { background:#000; border:3px solid #666; image-rendering:pixelated; max-width:96vw; height:auto; }
+  #msg { min-height:64px; max-width:620px; margin:8px auto; background:#141422; border:2px solid #777; border-radius:6px; padding:8px 12px; font-size:15px; text-align:left; white-space:pre-wrap; cursor:pointer; }
+  #choices { margin:6px auto; }
+  button { font-size:15px; padding:7px 16px; margin:3px; background:#2b2b44; color:#f0ead6; border:2px solid #888; border-radius:6px; cursor:pointer; }
+  button:hover { background:#3d3d5e; }
+  #battle { display:none; max-width:620px; margin:8px auto; background:#180f18; border:3px solid #a44; border-radius:8px; padding:10px; }
+  #battle canvas { border:2px solid #555; background:#20202e; }
+  .note { font-size:12px; color:#aaa; margin-top:6px; }
+</style>
+</head>
+<body>
+<h1>maou-rpg v0.1</h1>
+<div>
+  <span id="hud"></span>
+</div>
+<br>
+<canvas id="game" width="640" height="480"></canvas>
+
+<div id="battle">
+  <canvas id="bcanvas" width="192" height="192"></canvas>
+  <div id="blog" style="min-height:44px; margin:6px; font-size:15px; white-space:pre-wrap;"></div>
+  <div id="bcmds">
+    <button id="btnFight">たたかう</button>
+    <button id="btnHerb">やくそう</button>
+    <button id="btnRun">にげる</button>
+  </div>
+</div>
+
+<div id="msg">…</div>
+<div id="choices"></div>
+<button id="btnNew">ニューゲーム</button>
+<div class="note">移動：矢印キー / WASD　調べる・話す：Space / Z / Enter　セーブは IndexedDB に自動保存されます。</div>
+
+<script>
+"use strict";
+/* ============ Sprites (ChatGPT design, 16x16 grids) ============ */
+const PALETTE = {".":null, K:"#17202A", C:"#5DDCE7", S:"#2098B4", W:"#F7F5E8", P:"#8750C7", R:"#E85653", B:"#8C553A", G:"#58B76A", Y:"#F6C65B"};
+const SPRITES = {
+  puni: ["................","................","......KKKK......","....KKCCCCKK....","...KCCCCCCCCK...","..KCCCCCCCCCCK..","..KCCWKCCWKCCK..",".KCCCWKCCWKCCCK.",".KCCCCCCCCCCCCK.",".KCCCCCCCCCCCCK.",".KCCCSSSSSSCCCK.","..KCCCCCCCCCCK..","..KCCCCCCCCCCK..","...KKCCCCCCKK...",".....KKKKKK.....","................"],
+  bat:  ["................","................",".KK..........KK.",".KPK........KPK.",".KPPK......KPPK.",".KPPPK.KK.KPPPK.","..KPPPKPPKPPPK..","...KPPPPPPPPK...","....KPPPPPPK....","...KPWPPPPWPK...","...KPPPKKPPPK...","....KPPPPPPK....",".....KPKKPK.....","....KPK..KPK....","...KKK....KKK...","................"],
+  toge: ["................","................","......KKKK......","....KKRRRRKK....","...KRRRRRRRRK...","..KRRWWRRWWRRK..",".KRRRRRRRRRRRRK.",".KRRRRRRRRRRRRK.","..KKKKKKKKKKKK..",".....KBBBBK.....","....KBBBBBBK....","....KBWBBWBK....","....KBBBBBBK....",".....KBBBBK.....","......KKKK......","................"],
+  king: [".....YY..YY.....","....KYYKKYYK....","....KYYYYYYK....","....KKKKKKKK....","...KGGGGGGGGK...","..KGGGWWGGWWGK..","..KGGKWGGKWGGK..","..KGGGGGGGGGGK..","..KGGGKKKKGGGK..","...KGGGGGGGGK...","..KRRKKGGKKRRK..",".KRRRRKGGKRRRRK.",".KRRRRKGGKRRRRK.",".KRRRRKGGKRRRRK.","..KKKKK..KKKKK..","................"]
+};
+const MONSTERS = {
+  puni: {name:"ぷにぷに", hp:9,  atk:3, exp:2,  gold:3},
+  bat:  {name:"バットン", hp:6,  atk:4, exp:3,  gold:5},
+  toge: {name:"トゲタケ", hp:15, atk:5, exp:5,  gold:8},
+  king: {name:"魔王ゴブリンキング", hp:42, atk:6, exp:20, gold:30}
+};
+const LEVELS = {1:{maxhp:28, atk:7}, 2:{maxhp:34, atk:9}, 3:{maxhp:40, atk:11}};
+const EXP_NEXT = {1:8, 2:22}; // Lv2 at EXP>=8, Lv3 at EXP>=22
+
+/* ============ Maps (string grids) ============ */
+/* Legend: # wall, . floor, T tree, C church, I inn, S shop, E exit, V village entrance,
+   D cave entrance, G castle gate, X cave back exit, ? secret wall, P secret portal, * chest */
+const MAPS = {
+  village: {
+    name:"はじまりの村", w:12, h:10,
+    grid:[
+      "############",
+      "#..........#",
+      "#.C..I..S..#",
+      "#..........#",
+      "#..........#",
+      "#..........#",
+      "#..........#",
+      "#..........#",
+      "#..........#",
+      "#####E######"
+    ],
+    npcs:[
+      {x:3, y:4, color:"#c9a227", lines:["老人：「あの城には、裏から入れる道があると聞く。」"]},
+      {x:8, y:4, color:"#27ae60", lines:["商人：「洞窟の西の方じゃ、風が妙に冷たいんだ。」"]},
+      {x:5, y:6, color:"#e67e22", lines:["子ども：「岩を押したら、ちょっと動いたんだ！」"]}
+    ],
+    enemies:[]
+  },
+  field: {
+    name:"フィールド", w:40, h:30,
+    grid:[
+      "########################################",
+      "........................#...............",
+      "........................#...............",
+      "........T...............#.....T.........",
+      "........................#...............",
+      "........................#...............",
+      "........................#........G......",
+      "........................#...............",
+      "........................#...............",
+      "........................#...............",
+      "...T....................#...T...........",
+      "........................#...............",
+      "........................#...............",
+      "...................D....#...............",
+      "........................#...............",
+      "........................#...............",
+      "........................#...............",
+      "........................#...............",
+      "........................#...............",
+      "........................#...............",
+      "..............T.........#..........T....",
+      "........................#...............",
+      "........................#...............",
+      "........................#...............",
+      ".....V..................#...............",
+      "........................#...............",
+      "..........T.............#...............",
+      "........................#...............",
+      "........................#...............",
+      "########################################"
+    ],
+    npcs:[],
+    enemies:[
+      {type:"puni", x:10, y:20},
+      {type:"bat",  x:16, y:10}
+    ]
+  },
+  cave: {
+    name:"ほらあな", w:18, h:12,
+    grid:[
+      "##################",
+      "#....#.......#...#",
+      "#.*..#.......#.E.#",
+      "#....#...........#",
+      "#....#.....#.....#",
+      "#..........#.....#",
+      "#?...............#",
+      "#....#......#....#",
+      "#....#......#....#",
+      "#........#.......#",
+      "#................#",
+      "#########X########"
+    ],
+    npcs:[],
+    enemies:[
+      {type:"puni", x:12, y:3},
+      {type:"bat",  x:7,  y:8},
+      {type:"toge", x:4,  y:6}
+    ]
+  },
+  castle: {
+    name:"魔王の小城", w:14, h:12,
+    grid:[
+      "##############",
+      "#............#",
+      "#............#",
+      "#..........P.#",
+      "#.############",
+      "#.#.########.#",
+      "#.#.#......#.#",
+      "#.#.#.####.#.#",
+      "#.#...#..#...#",
+      "#.#.###.######",
+      "#.#.....#....#",
+      "#......G.....#"
+    ],
+    npcs:[],
+    enemies:[
+      {type:"bat",  x:3,  y:10},
+      {type:"toge", x:10, y:10},
+      {type:"king", x:7,  y:2}
+    ]
+  }
+};
+// Deep-copy grids so the secret wall can be mutated per session/save
+const grids = {};
+for (const k in MAPS) grids[k] = MAPS[k].grid.slice();
+
+function tileAt(map, x, y) {
+  if (x < 0 || y < 0 || x >= MAPS[map].w || y >= MAPS[map].h) return "#";
+  return grids[map][y].charAt(x);
+}
+function setTile(map, x, y, ch) {
+  const row = grids[map][y];
+  grids[map][y] = row.substring(0, x) + ch + row.substring(x + 1);
+}
+const SOLID = "#TCIS*?";
+function isSolid(map, x, y) { return SOLID.indexOf(tileAt(map, x, y)) >= 0; }
+
+/* ============ State ============ */
+function freshState() {
+  return { map:"village", x:6, y:8, dir:"down", lv:1, hp:LEVELS[1].maxhp, exp:0, gold:10,
+           herbs:1, secretOpen:false, cleared:false, chestOpened:false };
+}
+let S = freshState();
+let activeEnemies = []; // enemies present on current map visit
+
+function heroMaxHp() { return LEVELS[S.lv].maxhp; }
+function heroAtk() { return LEVELS[S.lv].atk; }
+
+function spawnEnemies() {
+  activeEnemies = MAPS[S.map].enemies
+    .filter(e => !(e.type === "king" && S.cleared))
+    .map(e => ({type:e.type, x:e.x, y:e.y, inactive:false}));
+}
+function enemyAt(x, y) {
+  return activeEnemies.find(e => !e.inactive && e.x === x && e.y === y);
+}
+
+/* ============ IndexedDB save ============ */
+let dbPromise = null;
+function openDB() {
+  if (!dbPromise) {
+    dbPromise = new Promise((res, rej) => {
+      const rq = indexedDB.open("maou-rpg", 1);
+      rq.onupgradeneeded = () => { rq.result.createObjectStore("save"); };
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => rej(rq.error);
+    });
+  }
+  return dbPromise;
+}
+async function saveGame() {
+  try {
+    const db = await openDB();
+    const tx = db.transaction("save", "readwrite");
+    tx.objectStore("save").put(JSON.parse(JSON.stringify(S)), "main");
+  } catch (e) { /* storage unavailable: game still runs */ }
+}
+async function loadGame() {
+  try {
+    const db = await openDB();
+    return await new Promise(res => {
+      const rq = db.transaction("save", "readonly").objectStore("save").get("main");
+      rq.onsuccess = () => res(rq.result || null);
+      rq.onerror = () => res(null);
+    });
+  } catch (e) { return null; }
+}
+async function deleteSave() {
+  try {
+    const db = await openDB();
+    db.transaction("save", "readwrite").objectStore("save").delete("main");
+  } catch (e) {}
+}
+
+/* ============ UI helpers ============ */
+const cv = document.getElementById("game"), ctx = cv.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+const hudEl = document.getElementById("hud");
+const msgEl = document.getElementById("msg");
+const choicesEl = document.getElementById("choices");
+let dialogQueue = [];   // array of strings, shown one by one
+let pendingChoices = null; // {options:[{label,fn}]} shown after dialog empties
+
+function updateHUD() {
+  hudEl.innerHTML =
+    "<span>" + MAPS[S.map].name + "</span>" +
+    "<span>Lv " + S.lv + "</span>" +
+    "<span>HP " + S.hp + "/" + heroMaxHp() + "</span>" +
+    "<span>EXP " + S.exp + "</span>" +
+    "<span>" + S.gold + " G</span>" +
+    "<span>やくそう " + S.herbs + "個</span>" +
+    (S.cleared ? "<span>★クリア済み</span>" : "");
+}
+function showDialog(lines, choices) {
+  dialogQueue = lines.slice();
+  pendingChoices = choices || null;
+  nextDialog();
+}
+function nextDialog() {
+  choicesEl.innerHTML = "";
+  if (dialogQueue.length > 0) {
+    msgEl.textContent = dialogQueue.shift() + "\n（クリック / Space で進む）";
+  } else if (pendingChoices) {
+    msgEl.textContent = pendingChoices.title || "どうする？";
+    pendingChoices.options.forEach(o => {
+      const b = document.createElement("button");
+      b.textContent = o.label;
+      b.onclick = () => { choicesEl.innerHTML = ""; msgEl.textContent = "…"; o.fn(); };
+      choicesEl.appendChild(b);
+    });
+    pendingChoices = null;
+  } else {
+    msgEl.textContent = "…";
+  }
+}
+function dialogActive() { return dialogQueue.length > 0 || msgEl.textContent !== "…" || choicesEl.children.length > 0; }
+msgEl.addEventListener("click", () => { if (!inBattle) nextDialog(); });
+
+/* ============ Rendering ============ */
+const TILE = 32;
+const TILE_COLORS = {
+  village: {floor:"#d8c690", wall:"#7a4a2b", alt:"#cbb582"},
+  field:   {floor:"#3f9e4d", wall:"#6b6b6b", alt:"#379145"},
+  cave:    {floor:"#3a3a44", wall:"#17171f", alt:"#33333d"},
+  castle:  {floor:"#5a5470", wall:"#241f33", alt:"#524c66"}
+};
+function drawSprite(c, grid, cx, cy, size) {
+  const px = size / 16;
+  for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+    const col = PALETTE[grid[y].charAt(x)];
+    if (col) { c.fillStyle = col; c.fillRect(cx + x * px, cy + y * px, px, px); }
+  }
+}
+function drawPerson(c, px, py, color) {
+  c.fillStyle = "#f2c894"; c.fillRect(px + 11, py + 5, 10, 9);      // head
+  c.fillStyle = "#17202A"; c.fillRect(px + 11, py + 3, 10, 4);      // hair
+  c.fillStyle = color;     c.fillRect(px + 9, py + 14, 14, 11);     // body
+  c.fillStyle = "#17202A"; c.fillRect(px + 10, py + 25, 5, 5); c.fillRect(px + 17, py + 25, 5, 5); // legs
+}
+function draw() {
+  const map = MAPS[S.map], pal = TILE_COLORS[S.map];
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cv.width, cv.height);
+  const mw = map.w * TILE, mh = map.h * TILE;
+  let ox, oy;
+  if (mw <= cv.width) ox = (cv.width - mw) / 2;
+  else ox = Math.max(cv.width - mw, Math.min(0, cv.width / 2 - (S.x * TILE + TILE / 2)));
+  if (mh <= cv.height) oy = (cv.height - mh) / 2;
+  else oy = Math.max(cv.height - mh, Math.min(0, cv.height / 2 - (S.y * TILE + TILE / 2)));
+
+  for (let y = 0; y < map.h; y++) for (let x = 0; x < map.w; x++) {
+    const t = tileAt(S.map, x, y), dx = ox + x * TILE, dy = oy + y * TILE;
+    ctx.fillStyle = ((x + y) % 2 === 0) ? pal.floor : pal.alt;
+    ctx.fillRect(dx, dy, TILE, TILE);
+    if (t === "#" || t === "?") {
+      ctx.fillStyle = (t === "?") ? "#22222c" : pal.wall;
+      ctx.fillRect(dx, dy, TILE, TILE);
+      ctx.fillStyle = "rgba(255,255,255,0.08)"; ctx.fillRect(dx, dy, TILE, 5);
+    } else if (t === "T") {
+      ctx.fillStyle = "#6b4a2b"; ctx.fillRect(dx + 13, dy + 18, 6, 10);
+      ctx.fillStyle = "#1e6b2e"; ctx.beginPath(); ctx.arc(dx + 16, dy + 13, 12, 0, 7); ctx.fill();
+    } else if (t === "C" || t === "I" || t === "S") {
+      ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 2, dy + 8, 28, 22);
+      ctx.fillStyle = t === "C" ? "#e8e4da" : (t === "I" ? "#c0392b" : "#2471a3");
+      ctx.beginPath(); ctx.moveTo(dx, dy + 10); ctx.lineTo(dx + 16, dy); ctx.lineTo(dx + 32, dy + 10); ctx.fill();
+      ctx.fillStyle = "#fff"; ctx.font = "bold 13px sans-serif"; ctx.textAlign = "center";
+      ctx.fillText(t === "C" ? "✚" : (t === "I" ? "宿" : "店"), dx + 16, dy + 25);
+    } else if (t === "*") {
+      if (!S.chestOpened) {
+        ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 5, dy + 11, 22, 15);
+        ctx.fillStyle = "#f6c65b"; ctx.fillRect(dx + 5, dy + 11, 22, 5); ctx.fillRect(dx + 14, dy + 11, 4, 15);
+      }
+    } else if (t === "P") {
+      ctx.fillStyle = "#0a0a12"; ctx.fillRect(dx, dy, TILE, TILE);
+      ctx.fillStyle = "#8750c7"; ctx.fillRect(dx + 3, dy + 3, 3, 3); ctx.fillRect(dx + 26, dy + 24, 3, 3);
+    } else if (t === "D" || t === "X" || t === "E" || t === "V" || t === "G") {
+      ctx.fillStyle = "#14141c"; ctx.fillRect(dx + 4, dy + 4, 24, 24);
+      ctx.fillStyle = "#f6c65b"; ctx.font = "bold 12px sans-serif"; ctx.textAlign = "center";
+      ctx.fillText(t === "G" ? "門" : "↓", dx + 16, dy + 21);
+    }
+  }
+  // NPCs
+  MAPS[S.map].npcs.forEach(n => drawPerson(ctx, ox + n.x * TILE, oy + n.y * TILE, n.color));
+  // Enemies (mini sprites)
+  activeEnemies.forEach(e => { if (!e.inactive) drawSprite(ctx, SPRITES[e.type], ox + e.x * TILE, oy + e.y * TILE, TILE); });
+  // Player (simple hero)
+  const px = ox + S.x * TILE, py = oy + S.y * TILE;
+  drawPerson(ctx, px, py, "#2456c7");
+  ctx.fillStyle = "#f6c65b"; ctx.fillRect(px + 11, py + 2, 10, 3); // circlet
+  updateHUD();
+}
+
+/* ============ Map transitions ============ */
+function goTo(map, x, y) {
+  S.map = map; S.x = x; S.y = y;
+  spawnEnemies();
+  saveGame(); draw();
+}
+function onStepTile(t) {
+  if (S.map === "village" && t === "E") goTo("field", 5, 24);
+  else if (S.map === "field" && t === "V") goTo("village", 6, 8);
+  else if (S.map === "field" && t === "D") goTo("cave", 9, 10);
+  else if (S.map === "field" && t === "G") goTo("castle", 7, 11);
+  else if (S.map === "cave" && t === "X") goTo("field", 19, 14);
+  else if (S.map === "cave" && t === "E") goTo("field", 27, 13);
+  else if (S.map === "cave" && t === "P") goTo("castle", 11, 3);
+  else if (S.map === "castle" && t === "P") goTo("cave", 2, 6);
+  else if (S.map === "castle" && t === "G") goTo("field", 33, 7);
+}
+
+/* ============ Movement & interaction ============ */
+const DIRS = { up:[0,-1], down:[0,1], left:[-1,0], right:[1,0] };
+function tryMove(dir) {
+  if (inBattle) return;
+  if (dialogActive()) { nextDialog(); return; }
+  S.dir = dir;
+  const d = DIRS[dir], nx = S.x + d[0], ny = S.y + d[1];
+  if (isSolid(S.map, nx, ny)) { draw(); return; }
+  if (MAPS[S.map].npcs.some(n => n.x === nx && n.y === ny)) { draw(); return; }
+  S.x = nx; S.y = ny;
+  const foe = enemyAt(nx, ny);
+  if (foe) { startBattle(foe); draw(); return; }
+  onStepTile(tileAt(S.map, nx, ny));
+  saveGame(); draw();
+}
+function facingPos() { const d = DIRS[S.dir]; return {x:S.x + d[0], y:S.y + d[1]}; }
+function interact() {
+  if (inBattle) return;
+  if (dialogActive()) { nextDialog(); return; }
+  const f = facingPos();
+  const npc = MAPS[S.map].npcs.find(n => n.x === f.x && n.y === f.y);
+  if (npc) { showDialog(npc.lines); return; }
+  const t = tileAt(S.map, f.x, f.y);
+  if (t === "C") {
+    saveGame();
+    showDialog(["教会：「よくぞ来た。冒険の記録を神に届けておいたぞ。」", "（セーブしました）"]);
+  } else if (t === "I") {
+    showDialog(["宿屋：「一泊 8G だよ。ゆっくり休んでいきな。」"], {
+      title:"宿屋：どうする？",
+      options:[
+        {label:"とまる（8G）", fn:() => {
+          if (S.gold >= 8) { S.gold -= 8; S.hp = heroMaxHp(); saveGame(); draw(); showDialog(["ぐっすり眠った。HPが全回復した！"]); }
+          else showDialog(["お金が足りないようだ。"]);
+        }},
+        {label:"やめる", fn:() => showDialog(["宿屋：「また来な。」"])}
+      ]});
+  } else if (t === "S") {
+    showDialog(["道具屋：「やくそうは 6G だよ。」"], {
+      title:"道具屋：どうする？",
+      options:[
+        {label:"やくそうを買う（6G）", fn:() => {
+          if (S.gold >= 6) { S.gold -= 6; S.herbs++; saveGame(); draw(); showDialog(["やくそうを 1個 買った。（現在 " + S.herbs + "個）"]); }
+          else showDialog(["お金が足りないようだ。"]);
+        }},
+        {label:"やめる", fn:() => showDialog(["道具屋：「まいど。」"])}
+      ]});
+  } else if (t === "*") {
+    if (!S.chestOpened) {
+      S.chestOpened = true; S.herbs++; saveGame(); draw();
+      showDialog(["宝箱を開けた！ やくそうを 1個 手に入れた。（現在 " + S.herbs + "個）"]);
+    } else showDialog(["宝箱は空っぽだ。"]);
+  } else if (t === "?" && S.map === "cave") {
+    // Secret wall: opens when checked (stand at 2,6 facing left is the natural spot)
+    setTile("cave", f.x, f.y, "P");
+    S.secretOpen = true; saveGame(); draw();
+    showDialog(["調べると、壁がゴロゴロと動いた！", "隠し通路が開いた。"]);
+  }
+}
+
+/* ============ Battle ============ */
+let inBattle = false, foe = null, foeHp = 0, battleTurn = 0;
+const battleEl = document.getElementById("battle");
+const blogEl = document.getElementById("blog");
+const bcv = document.getElementById("bcanvas"), bctx = bcv.getContext("2d");
+bctx.imageSmoothingEnabled = false;
+
+function startBattle(enemy) {
+  inBattle = true; foe = enemy; battleTurn = 0;
+  foeHp = MONSTERS[enemy.type].hp;
+  battleEl.style.display = "block";
+  bctx.fillStyle = "#20202e"; bctx.fillRect(0, 0, 192, 192);
+  drawSprite(bctx, SPRITES[enemy.type], 32, 32, 128);
+  const m = MONSTERS[enemy.type];
+  let txt = m.name + " が あらわれた！（HP " + foeHp + "）";
+  if (enemy.type === "bat") {
+    S.hp -= m.atk; battleTurn = 1;
+    txt += "\nバットンの先制攻撃！ " + m.atk + " のダメージ！（HP " + Math.max(0, S.hp) + "）";
+    if (S.hp <= 0) { blogEl.textContent = txt; setTimeout(defeat, 900); return; }
+  }
+  blogEl.textContent = txt;
+  updateHUD();
+}
+function enemyAttack() {
+  const m = MONSTERS[foe.type];
+  S.hp -= m.atk;
+  let txt = m.name + " の攻撃！ " + m.atk + " のダメージ！（HP " + Math.max(0, S.hp) + "/" + heroMaxHp() + "）";
+  if (S.hp <= 0) { blogEl.textContent = txt; setTimeout(defeat, 900); return; }
+  blogEl.textContent = txt;
+  updateHUD();
+}
+function winBattle() {
+  const m = MONSTERS[foe.type];
+  S.exp += m.exp; S.gold += m.gold;
+  let txt = m.name + " を倒した！ " + m.exp + " EXP、" + m.gold + " G を手に入れた。";
+  // Level up check (cap Lv3)
+  while (S.lv < 3 && EXP_NEXT[S.lv] && S.exp >= EXP_NEXT[S.lv]) {
+    S.lv++; S.hp += 6;
+    txt += "\nレベルが " + S.lv + " に上がった！ 最大HP+6、攻撃力 " + heroAtk() + "。";
+  }
+  foe.inactive = true;
+  const wasBoss = foe.type === "king";
+  inBattle = false; foe = null;
+  battleEl.style.display = "none";
+  saveGame(); draw();
+  if (wasBoss) {
+    S.cleared = true; saveGame(); draw();
+    showDialog([txt, "魔王ゴブリンキングを倒した！", "世界に平和が戻った…… v0.1 クリア！ おめでとう。"]);
+  } else {
+    showDialog([txt]);
+  }
+}
+function defeat() {
+  inBattle = false; foe = null;
+  battleEl.style.display = "none";
+  S.hp = heroMaxHp();
+  S.map = "village"; S.x = 2; S.y = 3; S.dir = "down";
+  spawnEnemies(); saveGame(); draw();
+  showDialog(["勇者は死んでしまった……", "教会で目を覚ました。HPは全回復している。（EXPとゴールドは失われていない）"]);
+}
+document.getElementById("btnFight").onclick = () => {
+  if (!inBattle) return;
+  battleTurn++;
+  const m = MONSTERS[foe.type];
+  let dmg = heroAtk(); let crit = false;
+  if (Math.random() < 0.10) { dmg *= 2; crit = true; }
+  foeHp -= dmg;
+  let txt = "勇者の攻撃！" + (crit ? " かいしんの一撃！" : "") + " " + dmg + " のダメージ！";
+  if (foeHp <= 0) { blogEl.textContent = txt; setTimeout(winBattle, 700); return; }
+  txt += "（敵HP " + foeHp + "）";
+  blogEl.textContent = txt;
+  setTimeout(enemyAttack, 700);
+};
+document.getElementById("btnHerb").onclick = () => {
+  if (!inBattle) return;
+  if (S.herbs <= 0) { blogEl.textContent = "やくそうがない！"; return; }
+  S.herbs--;
+  const healed = Math.min(16, heroMaxHp() - S.hp);
+  S.hp += healed;
+  blogEl.textContent = "やくそうを使った。HPが " + healed + " 回復した！（HP " + S.hp + "/" + heroMaxHp() + "）";
+  updateHUD();
+  setTimeout(enemyAttack, 700);
+};
+document.getElementById("btnRun").onclick = () => {
+  if (!inBattle) return;
+  if (foe.type === "king") { blogEl.textContent = "魔王からは逃げられない！"; return; }
+  foe.inactive = true; // stays inactive until map re-entry
+  inBattle = false; foe = null;
+  battleEl.style.display = "none";
+  saveGame(); draw();
+  showDialog(["勇者は逃げ出した。"]);
+};
+
+/* ============ Input ============ */
+document.addEventListener("keydown", e => {
+  const k = e.key;
+  if (k === "ArrowUp" || k === "w" || k === "W") { tryMove("up"); e.preventDefault(); }
+  else if (k === "ArrowDown" || k === "s" || k === "S") { tryMove("down"); e.preventDefault(); }
+  else if (k === "ArrowLeft" || k === "a" || k === "A") { tryMove("left"); e.preventDefault(); }
+  else if (k === "ArrowRight" || k === "d" || k === "D") { tryMove("right"); e.preventDefault(); }
+  else if (k === " " || k === "z" || k === "Z" || k === "Enter") { interact(); e.preventDefault(); }
+});
+document.getElementById("btnNew").onclick = async () => {
+  await deleteSave();
+  S = freshState();
+  grids.cave = MAPS.cave.grid.slice(); // restore secret wall
+  spawnEnemies();
+  msgEl.textContent = "…"; choicesEl.innerHTML = "";
+  saveGame(); draw();
+  showDialog(["新しい冒険が始まった。"]);
+};
+
+/* ============ Boot ============ */
+(async () => {
+  const loaded = await loadGame();
+  if (loaded && loaded.map && MAPS[loaded.map]) {
+    S = Object.assign(freshState(), loaded);
+    if (S.secretOpen) setTile("cave", 1, 6, "P");
+  }
+  spawnEnemies();
+  draw();
+  showDialog([S.cleared ? "（セーブデータを読み込んだ。クリア済みの世界だ）" : "（セーブデータを読み込んだ／新しい冒険）"]);
+})();
+</script>
+</body>
+</html>
