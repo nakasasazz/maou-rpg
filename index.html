@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>maou-rpg v0.3</title>
+<title>maou-rpg v0.4</title>
 <style>
   html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden; }
   body { display:flex; align-items:center; justify-content:center; }
@@ -32,10 +32,13 @@ const LEVELS = {1:{maxhp:28, atk:7}, 2:{maxhp:34, atk:9}, 3:{maxhp:40, atk:11}};
 const EXP_NEXT = {1:8, 2:22}; // Lv2 at EXP>=8, Lv3 at EXP>=22
 
 /* ============ Maps (string grids) ============
-   v0.3 changes: cave chest moved to a side-path dead end near the normal exit
-   (the north-east strip along row 1; leaving the main route at the shaft
-   (8,3) it is 9 steps in and 9 steps back = an 18-step round-trip detour),
-   old cart at the NW dead end (2,2), castle gate-side note at (5,11). */
+   v0.4: the cave (18x12) and castle (14x12) are split into two sub-maps
+   each (cave1/cave2 12x9, castle1/castle2 12x7) joined by stairs tiles.
+   'S' is the shop in the village but a stairs tile in dungeons.
+   cave1: entrance E(9,8), stairs S(9,2), hidden wall ?(1,6) — outside any
+   sheet; cave2: chest *(2,2), cart O(9,2), exit E(10,8);
+   castle1: note N(2,2), stairs S(9,2), gate E(6,6);
+   castle2: boss room east, back door E(11,4), stairs S(2,5). */
 const MAPS = {
   village: {
     name:"はじまりの村", w:12, h:10,
@@ -98,50 +101,74 @@ const MAPS = {
       {type:"bat",  x:16, y:10}
     ]
   },
-  cave: {
-    name:"ほらあな", w:18, h:12,
+  cave1: {
+    name:"ほらあな B1F", w:12, h:9,
     grid:[
-      "##################",
-      "#....#..........*#",
-      "#.O..#......###E##",
-      "#....#...........#",
-      "#....#.....#.....#",
-      "#..........#.....#",
-      "#?...............#",
-      "#....#......#....#",
-      "#....#......#....#",
-      "#........#.......#",
-      "#................#",
-      "#########X########"
+      "############",
+      "############",
+      "###..###.S##",
+      "###..###..##",
+      "####.####.##",
+      "##.........#",
+      "#?.........#",
+      "##.........#",
+      "#########E##"
     ],
     npcs:[],
     enemies:[
-      {type:"puni", x:12, y:3},
-      {type:"bat",  x:7,  y:8},
-      {type:"toge", x:4,  y:6}
+      {type:"puni", x:5, y:5},
+      {type:"bat",  x:8, y:6}
     ]
   },
-  castle: {
-    name:"魔王の小城", w:14, h:12,
+  cave2: {
+    name:"ほらあな B2F", w:12, h:9,
     grid:[
-      "##############",
-      "#............#",
-      "#............#",
-      "#..........P.#",
-      "#.############",
-      "#.#.########.#",
-      "#.#.#......#.#",
-      "#.#.#.####.#.#",
-      "#.#...#..#...#",
-      "#.#.###.######",
-      "#.#.....#....#",
-      "#....N.G.....#"
+      "############",
+      "#####.S#####",
+      "##*.#..#.O##",
+      "##..#..#..##",
+      "##.##..##.##",
+      "#..........#",
+      "#..........#",
+      "#..........#",
+      "##########E#"
     ],
     npcs:[],
     enemies:[
-      {type:"bat",  x:3,  y:10},
-      {type:"toge", x:10, y:10},
-      {type:"king", x:7,  y:2}
+      {type:"toge", x:7, y:5}
+    ]
+  },
+  castle1: {
+    name:"魔王の小城 1F", w:12, h:7,
+    grid:[
+      "############",
+      "############",
+      "##N.####.S##",
+      "##..####..##",
+      "#..........#",
+      "#..........#",
+      "######E#####"
+    ],
+    npcs:[],
+    enemies:[
+      {type:"bat",  x:5, y:4},
+      {type:"toge", x:8, y:5}
+    ]
+  },
+  castle2: {
+    name:"魔王の小城 2F", w:12, h:7,
+    grid:[
+      "############",
+      "############",
+      "##..####..##",
+      "##..####..##",
+      "#..........E",
+      "#.S........#",
+      "############"
+    ],
+    npcs:[],
+    enemies:[
+      {type:"king", x:9, y:2}
     ]
   }
 };
@@ -157,36 +184,49 @@ function setTile(map, x, y, ch) {
   grids[map][y] = row.substring(0, x) + ch + row.substring(x + 1);
 }
 const SOLID = "#TCIS*?ON";
-function isSolid(map, x, y) { return SOLID.indexOf(tileAt(map, x, y)) >= 0; }
+function isSolid(map, x, y) {
+  const t = tileAt(map, x, y);
+  if (t === "S") return map === "village"; // village: shop building; dungeons: stairs (step on to change floor)
+  return SOLID.indexOf(t) >= 0;
+}
 
-/* ============ Sections (cave & castle vision) ============
-   Every tile gets a section id. Only the player's current section is
-   visible (plus a 1-tile fringe of neighbouring sections: entrances and
-   boundary walls), with wall occlusion inside it. */
-function paintRect(arr, x0, y0, x1, y1, ch) {
-  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) arr[y][x] = ch;
+/* ============ Sheets (v0.4 vision) ============
+   No radius/LOS/section vision anywhere: the village and field are fully
+   visible, and in the cave/castle each map is ~70% visible with a few
+   opaque cloth "sheets" (rectangles) hiding a dead end, the chest, the
+   stairs or the boss. A sheet opens permanently the moment the hero steps
+   onto a walkable tile inside it (including arriving there by stairs);
+   it never closes again during the adventure. Sheets have no collision
+   of their own and give no message when opened. The hidden wall is NOT
+   under a sheet: a sheet's existence is obvious, a secret passage's is not. */
+const SHEETS = [
+  { id:"C1-A", map:"cave1",   x0:2, y0:1, x1:5,  y1:4 }, // west dead end (empty)
+  { id:"C1-B", map:"cave1",   x0:7, y0:1, x1:10, y1:4 }, // stairs to B2F
+  { id:"C2-A", map:"cave2",   x0:1, y0:1, x1:4,  y1:4 }, // treasure chest
+  { id:"C2-B", map:"cave2",   x0:7, y0:1, x1:10, y1:4 }, // old cart
+  { id:"K1-A", map:"castle1", x0:1, y0:1, x1:4,  y1:3 }, // note
+  { id:"K1-B", map:"castle1", x0:7, y0:1, x1:10, y1:3 }, // stairs to 2F
+  { id:"K2-A", map:"castle2", x0:1, y0:1, x1:4,  y1:3 }, // west dead end (empty)
+  { id:"K2-B", map:"castle2", x0:7, y0:1, x1:10, y1:3 }  // the Demon King
+];
+function sheetAt(map, x, y) {
+  for (const sh of SHEETS) {
+    if (sh.map === map && x >= sh.x0 && x <= sh.x1 && y >= sh.y0 && y <= sh.y1) return sh;
+  }
+  return null;
 }
-function buildSections(map, base) {
-  const a = [];
-  for (let y = 0; y < MAPS[map].h; y++) a.push(new Array(MAPS[map].w).fill(base));
-  return a;
+function isCovered(map, x, y) {
+  const sh = sheetAt(map, x, y);
+  return !!sh && S.openedSheets.indexOf(sh.id) < 0;
 }
-const SECTIONS = {};
-{
-  const c = buildSections("cave", "D");       // D = east / north rooms
-  paintRect(c, 0, 9, 17, 11, "A");            // A = entrance hall (south)
-  paintRect(c, 0, 0, 4, 8, "C");              // C = west (secret side)
-  paintRect(c, 5, 5, 7, 6, "C");              // C = west corridor rows 5-6
-  paintRect(c, 8, 3, 9, 8, "B");              // B = central shaft
-  paintRect(c, 13, 0, 17, 1, "E");            // E = chest side path (north-east)
-  paintRect(c, 15, 2, 15, 2, "E");            //    (normal-exit tile belongs to E)
-  SECTIONS.cave = c;
-  const s = buildSections("castle", "M");     // M = middle rooms
-  paintRect(s, 0, 0, 13, 3, "K");             // K = boss room
-  paintRect(s, 0, 4, 3, 11, "W");             // W = west column
-  paintRect(s, 11, 4, 13, 11, "E");           // E = east pocket
-  paintRect(s, 0, 11, 13, 11, "G");           // G = gate / bottom corridor
-  SECTIONS.castle = s;
+/* Called after every change of the hero's position (a step or a map
+   transfer): stepping onto a walkable tile inside a closed sheet opens it. */
+function checkSheets() {
+  const sh = sheetAt(S.map, S.x, S.y);
+  if (sh && S.openedSheets.indexOf(sh.id) < 0 && !isSolid(S.map, S.x, S.y)) {
+    S.openedSheets.push(sh.id);
+    saveQuiet();
+  }
 }
 
 /* ============ State ============ */
@@ -196,12 +236,17 @@ function freshState() {
            herbs:1, water:0, hasSleepPowder:false,
            secretOpen:false, cleared:false,
            chestOpened:false, chestStage:0,
+           openedSheets:[],
            stats:{ wins:0, steps:0, deaths:0, elapsedMs:0 },
            clearRecord:null };
 }
-/* Migrate any older save (v0.1/v0.2 fields) to v0.3: missing fields get
+/* Migrate any older save (v0.1-v0.3 fields) to v0.4: missing fields get
    defaults. A legacy save whose chest was already opened counts as
-   chest stage 1, so the sleep powder (stage 2) is still obtainable. */
+   chest stage 1, so the sleep powder (stage 2) is still obtainable.
+   v0.4: old vision state is dropped, all sheets start closed, and a
+   position inside the old single cave/castle maps is moved to the new
+   sub-map arrival point (cave -> cave1 entrance, castle -> castle1 gate)
+   so the hero can never end up buried in a wall. */
 function migrateSave(loaded) {
   const s = Object.assign(freshState(), loaded || {});
   if (!loaded || typeof loaded.chestStage !== "number") {
@@ -210,6 +255,9 @@ function migrateSave(loaded) {
   s.chestOpened = s.chestStage >= 1;
   if (typeof s.hasSleepPowder !== "boolean") s.hasSleepPowder = false;
   if (typeof s.water !== "number") s.water = 0;
+  if (!Array.isArray(s.openedSheets)) s.openedSheets = [];
+  if (s.map === "cave")   { s.map = "cave1";   s.x = 9; s.y = 7; }
+  if (s.map === "castle") { s.map = "castle1"; s.x = 6; s.y = 5; }
   s.stats = Object.assign({ wins:0, steps:0, deaths:0, elapsedMs:0 }, (loaded && loaded.stats) || {});
   if (!("clearRecord" in s) || s.clearRecord === undefined) s.clearRecord = null;
   return s;
@@ -232,10 +280,23 @@ function fmtTime(ms) {
 function heroMaxHp() { return LEVELS[S.lv].maxhp; }
 function heroAtk() { return LEVELS[S.lv].atk; }
 
-function spawnEnemies() {
-  activeEnemies = MAPS[S.map].enemies
+/* Enemy respawn unit = the whole dungeon (v0.4): enemy states are kept
+   per map, and a dungeon group's states are reset only when the hero
+   enters that group from outside it. Moving cave1<->cave2 or
+   castle1<->castle2 therefore does NOT respawn normal enemies and does
+   not clear flee-inactivity; going out to the field (or crossing between
+   cave and castle) does. The boss never respawns once defeated. */
+const DUNGEON_GROUP = { cave1:"cave", cave2:"cave", castle1:"castle", castle2:"castle" };
+function groupOf(map) { return DUNGEON_GROUP[map] || map; }
+let enemyStates = {}; // map -> [{type,x,y,inactive}]
+function freshEnemies(map) {
+  return MAPS[map].enemies
     .filter(e => !(e.type === "king" && S.cleared))
     .map(e => ({type:e.type, x:e.x, y:e.y, inactive:false}));
+}
+function spawnEnemies() {
+  if (!enemyStates[S.map]) enemyStates[S.map] = freshEnemies(S.map);
+  activeEnemies = enemyStates[S.map];
 }
 function enemyAt(x, y) {
   return activeEnemies.find(e => !e.inactive && e.x === x && e.y === y);
@@ -285,68 +346,17 @@ async function deleteSave() {
   } catch (e) {}
 }
 
-/* ============ Vision ============ */
-const VISION_RADIUS = { village:5 }; // field: unlimited; cave/castle: sections
-const SIGHT_BLOCKERS = "#?CISTON";
-function blocksSight(map, x, y) { return SIGHT_BLOCKERS.indexOf(tileAt(map, x, y)) >= 0; }
-/* Grid raycast (Amanatides & Woo). The target tile itself is not tested,
-   so a wall is visible while tiles behind it are not. When the ray passes
-   exactly through a grid corner, both orthogonal neighbours are tested,
-   which prevents diagonal corner leaking. */
-function losClear(map, x0, y0, x1, y1) {
-  let x = x0, y = y0;
-  const dx = x1 - x0, dy = y1 - y0;
-  const stepX = Math.sign(dx), stepY = Math.sign(dy);
-  const tDeltaX = dx !== 0 ? Math.abs(1 / dx) : Infinity;
-  const tDeltaY = dy !== 0 ? Math.abs(1 / dy) : Infinity;
-  let tMaxX = dx !== 0 ? tDeltaX * 0.5 : Infinity;
-  let tMaxY = dy !== 0 ? tDeltaY * 0.5 : Infinity;
-  while (x !== x1 || y !== y1) {
-    if (Math.abs(tMaxX - tMaxY) < 1e-9) {
-      if (blocksSight(map, x + stepX, y) || blocksSight(map, x, y + stepY)) return false;
-      x += stepX; y += stepY; tMaxX += tDeltaX; tMaxY += tDeltaY;
-    } else if (tMaxX < tMaxY) {
-      x += stepX; tMaxX += tDeltaX;
-    } else {
-      y += stepY; tMaxY += tDeltaY;
-    }
-    if (x === x1 && y === y1) break;
-    if (blocksSight(map, x, y)) return false;
-  }
-  return true;
-}
-function isVisible(x, y) {
-  if (x === S.x && y === S.y) return true;
-  if (S.map === "field") return true; // no limit inside the viewport
-  if (S.map === "village") {
-    const r = VISION_RADIUS.village;
-    if (Math.abs(x - S.x) > r || Math.abs(y - S.y) > r) return false;
-    return losClear(S.map, S.x, S.y, x, y);
-  }
-  // cave / castle: section-based vision + LOS
-  const sec = SECTIONS[S.map];
-  if (!sec || !sec[y]) return true;
-  const ps = sec[S.y][S.x], ts = sec[y][x];
-  if (ts !== ps) {
-    // Fringe: a tile of another section that touches the player's section
-    // (an entrance tile or a boundary wall) can be seen; nothing deeper.
-    let fringe = false;
-    const nb = [[1,0],[-1,0],[0,1],[0,-1]];
-    for (const d of nb) {
-      const nx = x + d[0], ny = y + d[1];
-      if (sec[ny] && sec[ny][nx] === ps) { fringe = true; break; }
-    }
-    if (!fringe) return false;
-  }
-  return losClear(S.map, S.x, S.y, x, y);
-}
+/* ============ Vision (v0.4) ============
+   There is no visibility computation any more: every map renders in
+   full, except that unopened sheets in the cave/castle are drawn over
+   their rectangle (see SHEETS above and drawMap). */
 
 /* ============ Canvas setup: fixed 400x240 logical resolution ============ */
 const cv = document.getElementById("game"), ctx = cv.getContext("2d");
 ctx.imageSmoothingEnabled = false;
 const W = 400, H = 240;
 const HIDDEN_COLOR = "#05080D";
-const INDOOR = { village:true, cave:true, castle:true }; // 32px tiles indoors
+const INDOOR = { village:true, cave1:true, cave2:true, castle1:true, castle2:true }; // 32px tiles indoors
 
 function fitCanvas() {
   const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
@@ -462,8 +472,8 @@ function menuBack() {
 async function resetGame() {
   await deleteSave();
   S = freshState();
-  grids.cave = MAPS.cave.grid.slice();
-  grids.castle = MAPS.castle.grid.slice();
+  for (const k in MAPS) grids[k] = MAPS[k].grid.slice();
+  enemyStates = {};
   playStart = Date.now();
   spawnEnemies();
   mode = "map"; menuScreen = "root"; newGameArmed = false;
@@ -573,8 +583,10 @@ function text(str, x, y, size, color, align) {
 const TILE_COLORS = {
   village: {floor:"#d8c690", wall:"#7a4a2b", alt:"#cbb582"},
   field:   {floor:"#3f9e4d", wall:"#6b6b6b", alt:"#379145"},
-  cave:    {floor:"#3a3a44", wall:"#17171f", alt:"#33333d"},
-  castle:  {floor:"#5a5470", wall:"#241f33", alt:"#524c66"}
+  cave1:   {floor:"#3a3a44", wall:"#17171f", alt:"#33333d"},
+  cave2:   {floor:"#3a3a44", wall:"#17171f", alt:"#33333d"},
+  castle1: {floor:"#5a5470", wall:"#241f33", alt:"#524c66"},
+  castle2: {floor:"#5a5470", wall:"#241f33", alt:"#524c66"}
 };
 const MENU_BTN = { x:328, y:4, w:68, h:20 };
 const DPAD = {
@@ -595,7 +607,7 @@ function drawTile(t, dx, dy, ts, pal, mx, my) {
   } else if (t === "T") {
     ctx.fillStyle = "#6b4a2b"; ctx.fillRect(dx + 7*u, dy + 9*u, 3*u, 6*u);
     ctx.fillStyle = "#1e6b2e"; ctx.beginPath(); ctx.arc(dx + 8*u, dy + 7*u, 6*u, 0, 7); ctx.fill();
-  } else if (t === "C" || t === "I" || t === "S") {
+  } else if (t === "C" || t === "I" || (t === "S" && S.map === "village")) {
     ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 1*u, dy + 5*u, 14*u, 11*u);
     ctx.fillStyle = t === "C" ? "#e8e4da" : (t === "I" ? "#c0392b" : "#2471a3");
     ctx.beginPath(); ctx.moveTo(dx, dy + 6*u); ctx.lineTo(dx + 8*u, dy); ctx.lineTo(dx + 16*u, dy + 6*u); ctx.fill();
@@ -626,7 +638,7 @@ function drawTile(t, dx, dy, ts, pal, mx, my) {
   } else if (t === "P") {
     ctx.fillStyle = "#0a0a12"; ctx.fillRect(dx, dy, ts, ts);
     ctx.fillStyle = "#8750c7"; ctx.fillRect(dx + 2*u, dy + 2*u, 2*u, 2*u); ctx.fillRect(dx + 12*u, dy + 12*u, 2*u, 2*u);
-  } else if (t === "D" || t === "X" || t === "E" || t === "V" || t === "G") {
+  } else if (t === "D" || t === "X" || t === "E" || t === "V" || t === "G" || t === "S") { // dungeon 'S' = stairs
     ctx.fillStyle = "#14141c"; ctx.fillRect(dx + 2*u, dy + 2*u, 12*u, 12*u);
     text(t === "G" ? "門" : "↓", dx + 8*u, dy + 4*u, 8 * u, "#f6c65b", "center");
   }
@@ -642,12 +654,26 @@ function drawMap() {
   for (let my = S.y - ryu; my <= S.y + ryd; my++) for (let mx = S.x - rx; mx <= S.x + rx; mx++) {
     const dx = pox + (mx - S.x) * ts, dy = poy + (my - S.y) * ts;
     if (mx < 0 || my < 0 || mx >= MAPS[S.map].w || my >= MAPS[S.map].h) continue; // out of map: dark
-    if (!isVisible(mx, my)) continue; // hidden: dark
     drawTile(tileAt(S.map, mx, my), dx, dy, ts, pal, mx, my);
   }
-  // NPCs / enemies: only when visible
-  MAPS[S.map].npcs.forEach(n => { if (isVisible(n.x, n.y)) drawPerson(ctx, pox + (n.x - S.x) * ts, poy + (n.y - S.y) * ts, n.color, ts); });
-  activeEnemies.forEach(e => { if (!e.inactive && isVisible(e.x, e.y)) drawSprite(ctx, SPRITES[e.type], pox + (e.x - S.x) * ts, poy + (e.y - S.y) * ts, ts); });
+  // NPCs / enemies: never drawn while hidden under an unopened sheet
+  MAPS[S.map].npcs.forEach(n => { if (!isCovered(S.map, n.x, n.y)) drawPerson(ctx, pox + (n.x - S.x) * ts, poy + (n.y - S.y) * ts, n.color, ts); });
+  activeEnemies.forEach(e => { if (!e.inactive && !isCovered(S.map, e.x, e.y)) drawSprite(ctx, SPRITES[e.type], pox + (e.x - S.x) * ts, poy + (e.y - S.y) * ts, ts); });
+  // Unopened sheets: opaque dark blue-grey cloth with a lattice pattern.
+  // Drawn over terrain and objects, under the hero. No icon, no animation,
+  // and the chest's sheet looks exactly like every other sheet.
+  for (const sh of SHEETS) {
+    if (sh.map !== S.map || S.openedSheets.indexOf(sh.id) >= 0) continue;
+    const dx = pox + (sh.x0 - S.x) * ts, dy = poy + (sh.y0 - S.y) * ts;
+    const sw = (sh.x1 - sh.x0 + 1) * ts, shh = (sh.y1 - sh.y0 + 1) * ts;
+    ctx.fillStyle = "#293344"; ctx.fillRect(dx, dy, sw, shh);
+    ctx.strokeStyle = "#354356"; ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let gx = dx + 8; gx < dx + sw; gx += 8) { ctx.moveTo(gx + 0.5, dy); ctx.lineTo(gx + 0.5, dy + shh); }
+    for (let gy = dy + 8; gy < dy + shh; gy += 8) { ctx.moveTo(dx, gy + 0.5); ctx.lineTo(dx + sw, gy + 0.5); }
+    ctx.stroke();
+    ctx.strokeStyle = "#59677B"; ctx.lineWidth = 2; ctx.strokeRect(dx + 1, dy + 1, sw - 2, shh - 2);
+  }
   // Player: always at screen center
   drawPerson(ctx, pox, poy, "#2456c7", ts);
   ctx.fillStyle = "#f6c65b"; ctx.fillRect(pox + 5 * (ts/16), poy, 6 * (ts/16), 2 * (ts/16)); // circlet
@@ -692,7 +718,7 @@ const SCREEN_TITLES = { root:"メニュー", items:"どうぐ", status:"つよ�
 function drawMenu() {
   ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
   text(SCREEN_TITLES[menuScreen], 16, 12, 15);
-  text("v0.3", 384, 14, 9, "#888", "right");
+  text("v0.4", 384, 14, 9, "#888", "right");
   const list = currentList();
   const cur = menuCursors[menuScreen] || 0;
   list.forEach((item, i) => {
@@ -794,20 +820,38 @@ function draw() {
 
 /* ============ Map transitions ============ */
 function goTo(map, x, y) {
+  // Entering a dungeon group from outside it respawns that group's enemies.
+  const pg = groupOf(S.map), ng = groupOf(map);
+  if (pg !== ng) for (const m in MAPS) if (groupOf(m) === ng) enemyStates[m] = freshEnemies(m);
   S.map = map; S.x = x; S.y = y;
   spawnEnemies();
+  checkSheets(); // arriving by stairs inside a sheet opens it too
   saveQuiet(); draw();
 }
+/* Arrival positions are always a separate floor tile next to the
+   connection tile, so transfers never chain. Field-side tiles/positions
+   are unchanged from v0.3; they now point at the sub-maps. The field
+   position (27,13) — where the cave's east exit emerges — is also the
+   way back into cave2. */
 function onStepTile(t) {
   if (S.map === "village" && t === "E") goTo("field", 5, 24);
   else if (S.map === "field" && t === "V") goTo("village", 6, 8);
-  else if (S.map === "field" && t === "D") goTo("cave", 9, 10);
-  else if (S.map === "field" && t === "G") goTo("castle", 7, 11);
-  else if (S.map === "cave" && t === "X") goTo("field", 19, 14);
-  else if (S.map === "cave" && t === "E") goTo("field", 27, 13);
-  else if (S.map === "cave" && t === "P") goTo("castle", 11, 3);
-  else if (S.map === "castle" && t === "P") goTo("cave", 2, 6);
-  else if (S.map === "castle" && t === "G") goTo("field", 33, 7);
+  else if (S.map === "field" && t === "D") goTo("cave1", 9, 7);
+  else if (S.map === "field" && t === "G") goTo("castle1", 6, 5);
+  else if (S.map === "field" && S.x === 27 && S.y === 13) goTo("cave2", 10, 7);
+  else if (S.map === "cave1" && t === "E") goTo("field", 19, 14);
+  else if (S.map === "cave1" && t === "S") goTo("cave2", 6, 2);
+  else if (S.map === "cave1" && t === "P") goTo("castle2", 10, 4);
+  else if (S.map === "cave2" && t === "S") goTo("cave1", 9, 3);
+  else if (S.map === "cave2" && t === "E") goTo("field", 27, 13);
+  else if (S.map === "castle1" && t === "E") goTo("field", 33, 7);
+  else if (S.map === "castle1" && t === "S") goTo("castle2", 2, 4);
+  else if (S.map === "castle2" && t === "S") goTo("castle1", 9, 3);
+  else if (S.map === "castle2" && t === "E") {
+    // Coming from the castle side also opens the hidden wall.
+    if (!S.secretOpen) { S.secretOpen = true; setTile("cave1", 1, 6, "P"); }
+    goTo("cave1", 2, 6);
+  }
 }
 
 /* ============ Movement & interaction ============ */
@@ -820,6 +864,7 @@ function tryMove(dir) {
   if (MAPS[S.map].npcs.some(n => n.x === nx && n.y === ny)) { draw(); return; }
   S.x = nx; S.y = ny;
   S.stats.steps++;
+  checkSheets(); // stepping into a sheet opens it before anything else happens there
   const foe = enemyAt(nx, ny);
   if (foe) { startBattle(foe); draw(); return; }
   onStepTile(tileAt(S.map, nx, ny));
@@ -845,6 +890,9 @@ function interact() {
   if (mode !== "map") return;
   if (dialogActive()) { advanceDialog(); return; }
   const f = facingPos();
+  // Nothing under an unopened sheet can be examined from outside it:
+  // no information leaks through the cloth.
+  if (isCovered(S.map, f.x, f.y)) return;
   const npc = MAPS[S.map].npcs.find(n => n.x === f.x && n.y === f.y);
   if (npc) { showDialog(npc.lines); return; }
   const t = tileAt(S.map, f.x, f.y);
@@ -860,7 +908,7 @@ function interact() {
         }},
         {label:"やめる", fn:() => showDialog(["宿屋：「また来な。」"])}
       ]});
-  } else if (t === "S") {
+  } else if (t === "S" && S.map === "village") {
     showDialog(["道具屋：「やくそうは 6G、水びんは 3G だよ。」"], {
       title:"道具屋：どうする？",
       options:[
@@ -882,8 +930,8 @@ function interact() {
     showDialog(["古い荷車がある。荷台にメモが残されている。", "「王がこん棒を振り上げたら、盾を構えろ。」"]);
   } else if (t === "N") {
     showDialog(["壁に書き置きがある。", "「王が暴れたときのために、見張りには眠り粉を持たせておく。」"]);
-  } else if (t === "?" && S.map === "cave") {
-    setTile("cave", f.x, f.y, "P");
+  } else if (t === "?" && S.map === "cave1") {
+    setTile("cave1", f.x, f.y, "P");
     S.secretOpen = true; saveQuiet(); draw();
     showDialog(["調べると、壁がゴロゴロと動いた！", "隠し通路が開いた。"]);
   }
@@ -1220,9 +1268,10 @@ cv.addEventListener("pointerdown", e => {
 /* ============ Boot ============ */
 (async () => {
   const loaded = await loadGame();
-  if (loaded && loaded.map && MAPS[loaded.map]) {
+  const KNOWN_MAPS = ["village", "field", "cave", "castle", "cave1", "cave2", "castle1", "castle2"];
+  if (loaded && loaded.map && KNOWN_MAPS.indexOf(loaded.map) >= 0) {
     S = migrateSave(loaded);
-    if (S.secretOpen) setTile("cave", 1, 6, "P");
+    if (S.secretOpen) setTile("cave1", 1, 6, "P");
   }
   playStart = Date.now();
   spawnEnemies();
