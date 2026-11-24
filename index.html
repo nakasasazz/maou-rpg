@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>maou-rpg v0.5</title>
+<title>maou-rpg v0.6</title>
 <style>
   html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden; }
   body { display:flex; align-items:center; justify-content:center; }
@@ -55,9 +55,9 @@ const MAPS = {
       "#####E######"
     ],
     npcs:[
-      {x:3, y:4, color:"#c9a227", lines:["老人：「昔は、城へ荷物を運ぶ地下道があったそうじゃ。」"]},
-      {x:8, y:4, color:"#27ae60", lines:["商人：「洞窟の西の壁から、風が吹いてくるんだ。」"]},
-      {x:5, y:6, color:"#e67e22", lines:["子ども：「洞窟で岩によりかかったら、ぐらっとしたよ。」"]}
+      {id:"elder", voice:"man", x:3, y:4, color:"#c9a227", lines:["老人：「昔は、城へ荷物を運ぶ地下道があったそうじゃ。」"]},
+      {id:"merchant", voice:"man", x:8, y:4, color:"#27ae60", lines:["商人：「洞窟の西の壁から、風が吹いてくるんだ。」"]},
+      {id:"child", voice:"child", x:5, y:6, color:"#e67e22", lines:["子ども：「洞窟で岩によりかかったら、ぐらっとしたよ。」"]}
     ],
     enemies:[]
   },
@@ -226,6 +226,13 @@ function isCovered(map, x, y) {
   const sh = sheetAt(map, x, y);
   return !!sh && !isSheetOpen(sh);
 }
+let lastSheetId = null;
+function updateSheetEntered() {
+  const sh = currentSheet();
+  const id = sh ? sh.id : null;
+  if (id && id !== lastSheetId) logEvent("sheet_enter", { sheet:id });
+  lastSheetId = id;
+}
 
 /* ============ State ============ */
 /*TEST:migrate:start*/
@@ -233,8 +240,8 @@ function freshState() {
   return { map:"village", x:6, y:8, dir:"down", lv:1, hp:LEVELS[1].maxhp, exp:0, gold:10,
            herbs:1, water:0, hasSleepPowder:false,
            secretOpen:false, cleared:false,
-           chestOpened:false, chestStage:0,
-           stats:{ wins:0, steps:0, deaths:0, elapsedMs:0 },
+           chestOpened:false, chestStage:0, soundOn:true,
+           stats:{ wins:0, steps:0, deaths:0, elapsedMs:0, battleTurns:0, talks:0 },
            clearRecord:null };
 }
 /* Migrate any older save (v0.1-v0.3 fields) to the current format:
@@ -257,7 +264,8 @@ function migrateSave(loaded) {
   delete s.openedSheets; // v0.4 field, ignored since v0.5
   if (s.map === "cave")   { s.map = "cave1";   s.x = 9; s.y = 7; }
   if (s.map === "castle") { s.map = "castle1"; s.x = 6; s.y = 5; }
-  s.stats = Object.assign({ wins:0, steps:0, deaths:0, elapsedMs:0 }, (loaded && loaded.stats) || {});
+  s.stats = Object.assign({ wins:0, steps:0, deaths:0, elapsedMs:0, battleTurns:0, talks:0 }, (loaded && loaded.stats) || {});
+  if (typeof s.soundOn !== "boolean") s.soundOn = true;
   if (!("clearRecord" in s) || s.clearRecord === undefined) s.clearRecord = null;
   return s;
 }
@@ -274,6 +282,149 @@ function fmtTime(ms) {
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), ss = sec % 60;
   const p = n => (n < 10 ? "0" : "") + n;
   return h > 0 ? h + ":" + p(m) + ":" + p(ss) : p(m) + ":" + p(ss);
+}
+
+/* ============ Play log (research data, IndexedDB key "log") ============
+   The log is intentionally separate from the game save: it records what
+   the player actually did (map changes, talks, battles and their length,
+   discoveries) so a session can be exported and studied. It is capped,
+   and writes are batched: important events flush immediately, everything
+   else flushes on a timer. */
+const LOG_CAP = 5000;
+const LOG_FLUSH_MS = 10000;
+const IMPORTANT_LOG_EVENTS = { start:true, load:true, battle_end:true, levelup:true, wipe:true, chest:true, secret_open:true, boss_win:true, save:true };
+let playLog = { version:1, events:[], dropped:0 };
+let logDirty = false;
+let logFlushTimer = null;
+let logFlushPromise = null;
+function scheduleLogFlush() {
+  if (logFlushTimer !== null || typeof setTimeout !== "function") return;
+  logFlushTimer = setTimeout(() => { logFlushTimer = null; flushLog(); }, LOG_FLUSH_MS);
+}
+function flushLog() {
+  if (logFlushPromise) return logFlushPromise;
+  if (!logDirty) return Promise.resolve();
+  const snapshot = JSON.parse(JSON.stringify(playLog));
+  logDirty = false;
+  logFlushPromise = (async () => {
+    try {
+      const db = await openDB();
+      await new Promise((res, rej) => {
+        const tx = db.transaction("save", "readwrite");
+        tx.objectStore("save").put(snapshot, "log");
+        tx.oncomplete = () => res();
+        tx.onerror = () => rej(tx.error);
+      });
+    } catch (e) {
+      logDirty = true;
+    } finally {
+      logFlushPromise = null;
+      if (logDirty) scheduleLogFlush();
+    }
+  })();
+  return logFlushPromise;
+}
+async function loadPlayLog() {
+  try {
+    const rec = await idbGet("log");
+    if (rec && Array.isArray(rec.events)) {
+      playLog = { version:1, events:rec.events.slice(), dropped:(typeof rec.dropped === "number" ? rec.dropped : 0) };
+    }
+  } catch (e) { /* an absent/corrupt log simply starts empty */ }
+  logDirty = false;
+}
+function logEvent(type, fields) {
+  const ev = { t: Math.max(0, Math.round(currentElapsed())), type:type };
+  if (fields) Object.assign(ev, fields);
+  playLog.events.push(ev);
+  if (playLog.events.length > LOG_CAP) {
+    const removed = playLog.events.length - LOG_CAP;
+    playLog.events.splice(0, removed);
+    playLog.dropped += removed;
+  }
+  logDirty = true;
+  if (IMPORTANT_LOG_EVENTS[type]) {
+    if (logFlushTimer !== null && typeof clearTimeout === "function") { clearTimeout(logFlushTimer); logFlushTimer = null; }
+    flushLog();
+  } else {
+    scheduleLogFlush();
+  }
+  return ev;
+}
+
+/* ============ Sound (WebAudio, synthesized; no external assets) ============
+   The context is created lazily on the first user gesture (browser
+   autoplay policy). Every tone is a tiny oscillator blip. The settings
+   option is persisted as S.soundOn; when it is off, nothing plays. */
+let audioCtx = null;
+function audioCtor() {
+  const g = (typeof globalThis !== "undefined") ? globalThis : {};
+  return g.AudioContext || (g.window && g.window.AudioContext) || g.webkitAudioContext || (g.window && g.window.webkitAudioContext) || null;
+}
+function initAudio() {
+  const Ctor = audioCtor();
+  if (!Ctor) return null;
+  if (!audioCtx) {
+    try { audioCtx = new Ctor(); } catch (e) { return null; }
+  }
+  if (audioCtx.state === "suspended" && audioCtx.resume) {
+    try { const p = audioCtx.resume(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+  }
+  return audioCtx;
+}
+function tone(freq, dur, opts) {
+  if (!S.soundOn) return;
+  const ac = initAudio();
+  if (!ac || !ac.createOscillator || !ac.createGain) return;
+  opts = opts || {};
+  const t0 = (ac.currentTime || 0) + (opts.at || 0);
+  const osc = ac.createOscillator();
+  const gainNode = ac.createGain();
+  const peak = (typeof opts.gain === "number") ? opts.gain : 0.08;
+  osc.type = opts.type || "square";
+  if (osc.frequency) {
+    if (osc.frequency.setValueAtTime) osc.frequency.setValueAtTime(freq, t0);
+    else osc.frequency.value = freq;
+    if (opts.slideTo && osc.frequency.exponentialRampToValueAtTime) {
+      try { osc.frequency.exponentialRampToValueAtTime(Math.max(1, opts.slideTo), t0 + dur); } catch (e) {}
+    }
+  }
+  if (gainNode.gain) {
+    const gp = gainNode.gain;
+    if (gp.setValueAtTime && gp.linearRampToValueAtTime && gp.exponentialRampToValueAtTime) {
+      gp.setValueAtTime(0.0001, t0);
+      gp.linearRampToValueAtTime(peak, t0 + 0.005);
+      gp.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    } else {
+      gp.value = peak;
+    }
+  }
+  osc.connect(gainNode);
+  gainNode.connect(ac.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.02);
+}
+/* playSound('pitfall') exists as a hook for future pitfall tiles: it is
+   implemented (a descending slide) but no tile triggers it yet. */
+function playSound(name, arg) {
+  if (!S.soundOn) return;
+  switch (name) {
+    case "confirm": tone(880, 0.06, { type:"square", gain:0.10 }); break;
+    case "cancel":  tone(440, 0.05, { type:"square", gain:0.06 }); break;
+    case "cursor":  tone(1200, 0.02, { type:"square", gain:0.025 }); break;
+    case "talk":
+      if (arg === "child") { tone(990, 0.05, { type:"square", gain:0.07 }); tone(990, 0.05, { type:"square", gain:0.07, at:0.07 }); }
+      else if (arg === "woman") tone(740, 0.07, { type:"triangle", gain:0.08 });
+      else if (arg === "man") tone(330, 0.08, { type:"square", gain:0.08 });
+      else tone(520, 0.05, { type:"triangle", gain:0.07 }); // object / default
+      break;
+    case "transition": tone(660, 0.12, { type:"triangle", gain:0.06, slideTo:330 }); break;
+    case "hit": tone(180, 0.05, { type:"square", gain:0.11, slideTo:80 }); break;
+    case "defeat": tone(392, 0.09, { type:"square", gain:0.08 }); tone(262, 0.14, { type:"square", gain:0.08, at:0.09 }); break;
+    case "victory": [523, 659, 784].forEach((f, i) => tone(f, 0.09, { type:"square", gain:0.07, at:i * 0.09 })); break;
+    case "levelup": [523, 659, 784, 1046].forEach((f, i) => tone(f, 0.09, { type:"triangle", gain:0.08, at:i * 0.08 })); break;
+    case "pitfall": tone(600, 0.35, { type:"sawtooth", gain:0.07, slideTo:80 }); break;
+  }
 }
 
 function heroMaxHp() { return LEVELS[S.lv].maxhp; }
@@ -338,6 +489,14 @@ async function loadGame() {
     });
   } catch (e) { return null; }
 }
+async function idbGet(key) {
+  const db = await openDB();
+  return await new Promise(res => {
+    const rq = db.transaction("save", "readonly").objectStore("save").get(key);
+    rq.onsuccess = () => res(rq.result || null);
+    rq.onerror = () => res(null);
+  });
+}
 async function deleteSave() {
   try {
     const db = await openDB();
@@ -398,9 +557,22 @@ function showDialog(lines, choices) {
   draw();
 }
 function dialogActive() { return dialogPages !== null || dialogChoices !== null; }
+/* A conversation/inspection starts here: it counts as one talk, is
+   logged with its target and voice type, and plays the talk sound in
+   that voice. Continuation pages and choice results use showDialog
+   directly and are not counted again. */
+function startTalk(lines, target, voiceType, choices) {
+  const voice = voiceType || "object";
+  S.stats.talks++;
+  logEvent("talk", { target: target || "object", voiceType: voice });
+  playSound("talk", voice);
+  saveQuiet();
+  showDialog(lines, choices);
+}
 function advanceDialog() {
   if (dialogChoices) return;
   if (!dialogPages) return;
+  playSound("confirm");
   dialogPages.shift();
   if (dialogPages.length === 0) {
     dialogPages = null;
@@ -414,17 +586,19 @@ function advanceDialog() {
 function chooseDialogOption(i) {
   const c = dialogChoices;
   if (!c) return;
+  playSound("confirm");
   dialogChoices = null;
   draw();
   c.options[i].fn();
 }
 
 /* ---------- menu (hierarchical) ---------- */
-let menuScreen = "root"; // root | items | status | save | settings
-const menuCursors = { root:0, items:0, save:0, settings:0 };
-let soundOn = true;
+let menuScreen = "root"; // root | items | status | record | save | settings
+const menuCursors = { root:0, items:0, record:0, save:0, settings:0 };
 let saveResult = "";
 let itemsNote = "";
+let recordNote = "";
+let recordPaneText = "";
 let newGameArmed = false;
 
 function inventoryList() {
@@ -441,30 +615,90 @@ function rootItems() {
   return [
     { id:"items",    label:"どうぐ" },
     { id:"status",   label:"つよさ" },
+    { id:"record",   label:"きろく" },
     { id:"save",     label:"セーブ" },
     { id:"settings", label:"せってい" },
     { id:"back",     label:"もどる" }
   ];
 }
+function recordItems() {
+  return [
+    { id:"copy",   label:"コピー",   desc:"プレイ経過をクリップボードにコピーします" },
+    { id:"export", label:"ログ出力", desc:"プレイログをJSONファイルに保存します" }
+  ];
+}
 function settingsItems() {
   return [
-    { id:"sound",   label:"おと " + (soundOn ? "ON" : "OFF"), desc:"おとの ON/OFF（いまは表示だけです）" },
+    { id:"sound",   label:"おと " + (S.soundOn ? "ON" : "OFF"), desc:"おとの ON/OFF" },
     { id:"newgame", label:"ニューゲーム", desc: newGameArmed ? "もう一度 決定すると、セーブを消して 最初からになります" : "セーブを消して 最初から やり直します" }
   ];
 }
 function currentList() {
   if (menuScreen === "root") return rootItems();
   if (menuScreen === "items") return inventoryList();
+  if (menuScreen === "record") return recordItems();
   if (menuScreen === "save") return [{ id:"save", label:"セーブする" }];
   if (menuScreen === "settings") return settingsItems();
   return []; // status: no selection
 }
+/* ---------- play history: share text & log export ---------- */
+function formatCount(n) { return Number(n || 0).toLocaleString("en-US"); }
+/* The share text deliberately contains no undiscovered secrets: it never
+   mentions the hidden passage, the chest's second layer, or the sleep
+   powder (not even after the powder is obtained). */
+function buildShareText() {
+  return "maou-rpg v0.6 / Lv" + S.lv +
+    " / プレイ時間 " + fmtTime(currentElapsed()) +
+    " / 歩数 " + formatCount(S.stats.steps) +
+    " / 勝利 " + S.stats.wins +
+    " / 全滅 " + S.stats.deaths +
+    " / 魔王：" + (S.cleared ? "撃破" : "未撃破") +
+    " / 現在地：" + MAPS[S.map].name;
+}
+async function copyShareText() {
+  const txt = buildShareText();
+  try {
+    if (typeof navigator === "undefined" || !navigator.clipboard || !navigator.clipboard.writeText) throw new Error("clipboard unavailable");
+    await navigator.clipboard.writeText(txt);
+    recordNote = "コピーしました";
+    recordPaneText = "";
+  } catch (e) {
+    recordNote = "コピーできませんでした。下の文字列を手でコピーしてください。";
+    recordPaneText = txt;
+  }
+  draw();
+}
+function exportPlayLog() {
+  try {
+    const now = new Date();
+    const p = n => (n < 10 ? "0" : "") + n;
+    const name = "maou-rpg-log-" + now.getFullYear() + p(now.getMonth() + 1) + p(now.getDate()) + "-" + p(now.getHours()) + p(now.getMinutes()) + ".json";
+    const blob = new Blob([JSON.stringify(playLog, null, 2)], { type:"application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    if (document.body && document.body.appendChild) document.body.appendChild(a);
+    a.click();
+    if (a.remove) a.remove();
+    if (typeof setTimeout === "function") setTimeout(() => { if (URL.revokeObjectURL) URL.revokeObjectURL(url); }, 1000);
+    recordNote = "ログを出力しました：" + name;
+    recordPaneText = "";
+    flushLog();
+  } catch (e) {
+    recordNote = "ログ出力に失敗しました";
+    recordPaneText = "";
+  }
+  draw();
+}
+
 function openMenu() {
-  mode = "menu"; menuScreen = "root"; saveResult = ""; itemsNote = ""; newGameArmed = false;
+  mode = "menu"; menuScreen = "root"; saveResult = ""; itemsNote = ""; recordNote = ""; recordPaneText = ""; newGameArmed = false;
   draw();
 }
 function closeMenu() { mode = "map"; draw(); }
 function menuBack() {
+  playSound("cancel");
   if (menuScreen === "root") closeMenu();
   else { menuScreen = "root"; newGameArmed = false; draw(); }
 }
@@ -475,7 +709,9 @@ async function resetGame() {
   enemyStates = {};
   playStart = Date.now();
   spawnEnemies();
+  lastSheetId = currentSheet() ? currentSheet().id : null;
   mode = "map"; menuScreen = "root"; newGameArmed = false;
+  logEvent("start");
   saveQuiet();
   showDialog(["新しい冒険が始まった。"]);
   draw();
@@ -485,9 +721,13 @@ function menuConfirm() {
   const cur = menuCursors[menuScreen] || 0;
   const item = list[cur];
   if (!item) return;
+  if (menuScreen === "root" && item.id === "back") { menuBack(); return; }
+  playSound("confirm");
   if (menuScreen === "root") {
-    if (item.id === "back") closeMenu();
-    else { menuScreen = item.id; saveResult = ""; itemsNote = ""; draw(); }
+    menuScreen = item.id; saveResult = ""; itemsNote = ""; recordNote = ""; recordPaneText = ""; draw();
+  } else if (menuScreen === "record") {
+    if (item.id === "copy") copyShareText();
+    else if (item.id === "export") exportPlayLog();
   } else if (menuScreen === "items") {
     if (item.id === "herb") {
       if (S.herbs <= 0) { itemsNote = "やくそうが ない"; }
@@ -510,11 +750,17 @@ function menuConfirm() {
   } else if (menuScreen === "save") {
     if (item.id === "save") {
       saveResult = "";
-      saveGame().then(() => { saveResult = "セーブしました"; draw(); })
+      saveGame().then(() => { logEvent("save"); saveResult = "セーブしました"; draw(); })
                 .catch(() => { saveResult = "セーブに失敗しました"; draw(); });
     }
   } else if (menuScreen === "settings") {
-    if (item.id === "sound") { soundOn = !soundOn; draw(); }
+    if (item.id === "sound") {
+      const wasOn = S.soundOn;
+      S.soundOn = !S.soundOn;
+      if (!wasOn && S.soundOn) { initAudio(); playSound("confirm"); }
+      saveQuiet();
+      draw();
+    }
     else if (item.id === "newgame") {
       if (!newGameArmed) { newGameArmed = true; draw(); }
       else resetGame();
@@ -525,18 +771,22 @@ function menuMove(d) {
   const list = currentList();
   if (list.length === 0) return;
   const n = list.length;
-  menuCursors[menuScreen] = ((menuCursors[menuScreen] || 0) + d + n) % n;
+  const before = menuCursors[menuScreen] || 0;
+  menuCursors[menuScreen] = (before + d + n) % n;
+  if (menuCursors[menuScreen] !== before) playSound("cursor");
   itemsNote = "";
+  recordNote = ""; recordPaneText = "";
   if (menuScreen === "settings") newGameArmed = false;
   draw();
 }
 function menuClick(p) {
   if (inRect(p, 16, 206, 80, 26)) { menuBack(); return; }
   const list = currentList();
+  const baseY = (menuScreen === "record") ? 148 : 50;
   for (let i = 0; i < list.length; i++) {
-    if (inRect(p, 32, 50 + i * 26, 336, 26)) {
+    if (inRect(p, 32, baseY + i * 26, 336, 26)) {
       if (menuCursors[menuScreen] === i) menuConfirm();
-      else { menuCursors[menuScreen] = i; itemsNote = ""; if (menuScreen === "settings") newGameArmed = false; draw(); }
+      else { menuCursors[menuScreen] = i; playSound("cursor"); itemsNote = ""; recordNote = ""; recordPaneText = ""; if (menuScreen === "settings") newGameArmed = false; draw(); }
       return;
     }
   }
@@ -714,11 +964,58 @@ function drawMap() {
 }
 
 /* ============ Menu rendering ============ */
-const SCREEN_TITLES = { root:"メニュー", items:"どうぐ", status:"つよさ", save:"セーブ", settings:"せってい" };
+const SCREEN_TITLES = { root:"メニュー", items:"どうぐ", status:"つよさ", record:"きろく", save:"セーブ", settings:"せってい" };
+function wrapText(s, max) {
+  const out = [];
+  let t = String(s);
+  while (t.length > max) { out.push(t.substring(0, max)); t = t.substring(max); }
+  out.push(t);
+  return out;
+}
+function drawRecordMenu() {
+  ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
+  text("きろく", 16, 12, 15);
+  text("v0.6", 384, 14, 9, "#888", "right");
+  const rows = [
+    ["プレイ時間", fmtTime(currentElapsed()), "レベル", String(S.lv)],
+    ["歩数", formatCount(S.stats.steps), "勝利", String(S.stats.wins)],
+    ["戦闘ターン", String(S.stats.battleTurns || 0), "会話", String(S.stats.talks || 0)],
+    ["全滅", String(S.stats.deaths), "魔王", S.cleared ? "撃破" : "未撃破"]
+  ];
+  rows.forEach((r, i) => {
+    const y = 42 + i * 18;
+    text(r[0], 16, y, 11, "#cfc9b8");
+    text(r[1], 96, y, 11, "#fff", "right");
+    text(r[2], 150, y, 11, "#cfc9b8");
+    text(r[3], 230, y, 11, "#fff", "right");
+  });
+  let noteY = 120;
+  if (S.clearRecord) {
+    const cr = S.clearRecord;
+    text("クリア記録　" + fmtTime(cr.timeMs) + " / Lv" + cr.lv + " / 勝利 " + cr.wins + " / 歩数 " + formatCount(cr.steps) + " / 全滅 " + cr.deaths, 16, 118, 10, "#9fe870");
+    noteY = 136;
+  }
+  if (recordNote) text(recordNote, 16, noteY, 9, "#e8c95a");
+  const list = currentList();
+  const cur = menuCursors.record || 0;
+  list.forEach((item, i) => {
+    const y = 148 + i * 26;
+    if (i === cur) text("▶", 32, y + 4, 13, "#f6c65b");
+    text(item.label, 52, y + 4, 13, i === cur ? "#fff" : "#cfc9b8");
+  });
+  if (recordPaneText) {
+    box(104, 190, 288, 44);
+    wrapText(recordPaneText, 32).slice(0, 3).forEach((ln, i) => text(ln, 112, 195 + i * 12, 8.5));
+  }
+  ctx.fillStyle = "#2b2b44"; ctx.fillRect(16, 206, 80, 26);
+  ctx.strokeStyle = "#f0ead6"; ctx.lineWidth = 1; ctx.strokeRect(16.5, 206.5, 79, 25);
+  text("もどる", 56, 212, 12, "#f0ead6", "center");
+}
 function drawMenu() {
+  if (menuScreen === "record") { drawRecordMenu(); return; }
   ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
   text(SCREEN_TITLES[menuScreen], 16, 12, 15);
-  text("v0.5", 384, 14, 9, "#888", "right");
+  text("v0.6", 384, 14, 9, "#888", "right");
   const list = currentList();
   const cur = menuCursors[menuScreen] || 0;
   list.forEach((item, i) => {
@@ -820,11 +1117,17 @@ function draw() {
 
 /* ============ Map transitions ============ */
 function goTo(map, x, y) {
+  const from = S.map;
   // Entering a dungeon group from outside it respawns that group's enemies.
   const pg = groupOf(S.map), ng = groupOf(map);
   if (pg !== ng) for (const m in MAPS) if (groupOf(m) === ng) enemyStates[m] = freshEnemies(m);
   S.map = map; S.x = x; S.y = y;
   spawnEnemies();
+  if (from !== map) {
+    logEvent("map", { from:from, to:map });
+    playSound("transition");
+  }
+  updateSheetEntered();
   // Sheet visibility follows the new position automatically (v0.5).
   saveQuiet(); draw();
 }
@@ -849,7 +1152,7 @@ function onStepTile(t) {
   else if (S.map === "castle2" && t === "S") goTo("castle1", 9, 3);
   else if (S.map === "castle2" && t === "E") {
     // Coming from the castle side also opens the hidden wall.
-    if (!S.secretOpen) { S.secretOpen = true; setTile("cave1", 1, 6, "P"); }
+    if (!S.secretOpen) { S.secretOpen = true; setTile("cave1", 1, 6, "P"); logEvent("secret_open"); }
     goTo("cave1", 2, 6);
   }
 }
@@ -864,6 +1167,7 @@ function tryMove(dir) {
   if (MAPS[S.map].npcs.some(n => n.x === nx && n.y === ny)) { draw(); return; }
   S.x = nx; S.y = ny;
   S.stats.steps++;
+  updateSheetEntered();
   // Sheet visibility follows the new position automatically (v0.5).
   const foe = enemyAt(nx, ny);
   if (foe) { startBattle(foe); draw(); return; }
@@ -876,12 +1180,15 @@ function facingPos() { const d = DIRS[S.dir]; return {x:S.x + d[0], y:S.y + d[1]
 function applyChest() {
   if (S.chestStage === 0) {
     S.chestStage = 1; S.chestOpened = true; S.herbs += 2;
+    logEvent("chest", { stage:S.chestStage });
     return ["宝箱を開けた！ やくそうを 2個 手に入れた。（現在 " + S.herbs + "個）"];
   }
   if (S.chestStage === 1) {
     S.chestStage = 2; S.hasSleepPowder = true;
+    logEvent("chest", { stage:S.chestStage });
     return ["宝箱の底を もう一度調べると……", "二重底になっていた！ ねむり粉の小袋を 手に入れた。"];
   }
+  logEvent("chest", { stage:S.chestStage });
   return ["宝箱は空っぽだ。"];
 }
 /*TEST:chest:end*/
@@ -894,30 +1201,31 @@ function interact() {
   // no information leaks through the cloth.
   if (isCovered(S.map, f.x, f.y)) return;
   const npc = MAPS[S.map].npcs.find(n => n.x === f.x && n.y === f.y);
-  if (npc) { showDialog(npc.lines); return; }
+  if (npc) { startTalk(npc.lines, npc.id || "npc", npc.voice || "object"); return; }
   const t = tileAt(S.map, f.x, f.y);
   if (t === "C") {
     saveQuiet();
-    showDialog(["教会：「よくぞ来た。冒険の記録を神に届けておいたぞ。」", "（セーブしました）"]);
+    logEvent("save");
+    startTalk(["教会：「よくぞ来た。冒険の記録を神に届けておいたぞ。」", "（セーブしました）"], "church", "object");
   } else if (t === "I") {
-    showDialog(["宿屋：「無料だよ。ゆっくり休んでいきな。」"], {
+    startTalk(["宿屋：「無料だよ。ゆっくり休んでいきな。」"], "inn", "object", {
       title:"宿屋：どうする？",
       options:[
         {label:"とまる（無料）", fn:() => {
-          S.hp = heroMaxHp(); saveQuiet(); draw(); showDialog(["ぐっすり眠った。HPが全回復した！"]);
+          S.hp = heroMaxHp(); logEvent("inn"); saveQuiet(); draw(); showDialog(["ぐっすり眠った。HPが全回復した！"]);
         }},
         {label:"やめる", fn:() => showDialog(["宿屋：「また来な。」"])}
       ]});
   } else if (t === "S" && S.map === "village") {
-    showDialog(["道具屋：「やくそうは 6G、水びんは 3G だよ。」"], {
+    startTalk(["道具屋：「やくそうは 6G、水びんは 3G だよ。」"], "shop", "object", {
       title:"道具屋：どうする？",
       options:[
         {label:"やくそうを買う（6G）", fn:() => {
-          if (S.gold >= 6) { S.gold -= 6; S.herbs++; saveQuiet(); draw(); showDialog(["やくそうを 1個 買った。（現在 " + S.herbs + "個）"]); }
+          if (S.gold >= 6) { S.gold -= 6; S.herbs++; logEvent("buy", { item:"herb" }); saveQuiet(); draw(); showDialog(["やくそうを 1個 買った。（現在 " + S.herbs + "個）"]); }
           else showDialog(["お金が足りないようだ。"]);
         }},
         {label:"水びんを買う（3G）", fn:() => {
-          if (S.gold >= 3) { S.gold -= 3; S.water++; saveQuiet(); draw(); showDialog(["水びんを 1個 買った。（現在 " + S.water + "個）"]); }
+          if (S.gold >= 3) { S.gold -= 3; S.water++; logEvent("buy", { item:"water" }); saveQuiet(); draw(); showDialog(["水びんを 1個 買った。（現在 " + S.water + "個）"]); }
           else showDialog(["お金が足りないようだ。"]);
         }},
         {label:"やめる", fn:() => showDialog(["道具屋：「まいど。」"])}
@@ -925,15 +1233,15 @@ function interact() {
   } else if (t === "*") {
     const lines = applyChest();
     saveQuiet(); draw();
-    showDialog(lines);
+    startTalk(lines, "chest", "object");
   } else if (t === "O") {
-    showDialog(["古い荷車がある。荷台にメモが残されている。", "「王がこん棒を振り上げたら、盾を構えろ。」"]);
+    startTalk(["古い荷車がある。荷台にメモが残されている。", "「王がこん棒を振り上げたら、盾を構えろ。」"], "cart", "object");
   } else if (t === "N") {
-    showDialog(["壁に書き置きがある。", "「王が暴れたときのために、見張りには眠り粉を持たせておく。」"]);
+    startTalk(["壁に書き置きがある。", "「王が暴れたときのために、見張りには眠り粉を持たせておく。」"], "note", "object");
   } else if (t === "?" && S.map === "cave1") {
     setTile("cave1", f.x, f.y, "P");
-    S.secretOpen = true; saveQuiet(); draw();
-    showDialog(["調べると、壁がゴロゴロと動いた！", "隠し通路が開いた。"]);
+    S.secretOpen = true; logEvent("secret_open"); saveQuiet(); draw();
+    startTalk(["調べると、壁がゴロゴロと動いた！", "隠し通路が開いた。"], "secret_wall", "object");
   }
 }
 
@@ -963,10 +1271,15 @@ let powderUsed = false;     // sleep powder: once per battle
 let foeSkip = false;        // toge soaked by water: skips this turn
 let batPreempt = false, batFirstTurn = false;
 let battleItemsOpen = false, battleItemCursor = 0;
+let battleTurns = 0;
+function logBattleEnd(result, enemyType, hp) {
+  logEvent("battle_end", { enemy:enemyType, result:result, turns:battleTurns, heroHp:hp });
+}
 
 function setBattleMsg(t) { battleMsg = t; if (mode === "battle") draw(); }
 function startBattle(enemy) {
   inBattle = true; foe = enemy; battleBusy = false; battleCursor = 0;
+  battleTurns = 0;
   foeHp = MONSTERS[enemy.type].hp;
   foeState = { sleep:0, phase:1, reset:false };
   foeFlat = false; defending = false; powderUsed = false; foeSkip = false;
@@ -974,6 +1287,7 @@ function startBattle(enemy) {
   batFirstTurn = (enemy.type === "bat");
   battleItemsOpen = false; battleItemCursor = 0;
   mode = "battle";
+  logEvent("battle_start", { enemy:enemy.type });
   const m = MONSTERS[enemy.type];
   setBattleMsg(m.name + " が あらわれた！" + (enemy.type === "bat" ? "\nバットンは すばやい！" : ""));
   draw();
@@ -982,6 +1296,7 @@ function endTurn() { defending = false; battleBusy = false; draw(); }
 function foeHit(raw, label) {
   const m = MONSTERS[foe.type];
   const dmg = defending ? defendReduce(raw) : raw;
+  playSound("hit");
   S.hp -= dmg;
   if (foe.type === "puni" && defending) {
     foeFlat = true;
@@ -1029,8 +1344,9 @@ function heroPhase(action, enemyAlreadyActed) {
     let crit = false;
     if (Math.random() < 0.05) { dmg *= 2; crit = true; }
     foeHp -= dmg;
+    playSound("hit");
     setBattleMsg((crit ? "かいしんの一撃！" : "勇者の攻撃！") + "\n" + dmg + " のダメージ！");
-    if (foeHp <= 0) { setTimeout(winBattle, 800); return; }
+    if (foeHp <= 0) { playSound("defeat"); setTimeout(winBattle, 800); return; }
   } else if (action.kind === "defend") {
     defending = true;
     setBattleMsg("勇者は身を守った。");
@@ -1043,8 +1359,9 @@ function heroPhase(action, enemyAlreadyActed) {
     S.water--;
     if (foe.type === "toge") {
       foeHp -= 8; foeSkip = true;
+      playSound("hit");
       setBattleMsg("水びんを投げつけた！\nトゲタケに 8 のダメージ！ 傘がしぼんだ！");
-      if (foeHp <= 0) { setTimeout(winBattle, 800); return; }
+      if (foeHp <= 0) { playSound("defeat"); setTimeout(winBattle, 800); return; }
     } else {
       setBattleMsg("水びんを投げつけた！\nしかし、効果がなかった。");
     }
@@ -1063,11 +1380,14 @@ function heroPhase(action, enemyAlreadyActed) {
 function heroAction(action) {
   if (!inBattle || battleBusy) return;
   battleBusy = true;
+  battleTurns++;
+  S.stats.battleTurns++;
   /* Bat preemptive strike: defend and sleep powder resolve BEFORE it;
      every other first action lets the bat strike first (that strike is
      the bat's action for the turn). */
   if (batPreempt && action.kind !== "defend" && action.kind !== "powder") {
     batPreempt = false; batFirstTurn = false;
+    playSound("hit");
     S.hp -= MONSTERS.bat.atk;
     setBattleMsg("バットンの先制攻撃！\n" + MONSTERS.bat.atk + " のダメージ！");
     if (S.hp <= 0) { setTimeout(defeat, 900); return; }
@@ -1078,6 +1398,7 @@ function heroAction(action) {
   heroPhase(action, false);
 }
 function escapeBattle() {
+  if (foe) logBattleEnd("flee", foe.type, S.hp);
   foe.inactive = true;
   inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
   mode = "map";
@@ -1087,8 +1408,11 @@ function escapeBattle() {
 function doRun() {
   if (!inBattle || battleBusy) return;
   if (foe.type === "king") { setBattleMsg("魔王からは逃げられない！"); return; }
+  battleTurns++;
+  S.stats.battleTurns++;
   if (batPreempt) {
     batPreempt = false; batFirstTurn = false; battleBusy = true;
+    playSound("hit");
     S.hp -= MONSTERS.bat.atk;
     setBattleMsg("バットンの先制攻撃！\n" + MONSTERS.bat.atk + " のダメージ！");
     if (S.hp <= 0) { setTimeout(defeat, 900); return; }
@@ -1111,33 +1435,44 @@ function battleItems() {
 function useBattleItem(i) {
   const it = battleItems()[i];
   if (!it) return;
-  if (it.kind === "back") { battleItemsOpen = false; draw(); return; }
+  if (it.kind === "back") { playSound("cancel"); battleItemsOpen = false; draw(); return; }
   if (!it.usable) {
+    playSound("cancel");
     battleItemsOpen = false;
     setBattleMsg("それは今 使えない。");
     draw(); return;
   }
+  playSound("confirm");
   battleItemsOpen = false;
   heroAction({ kind: it.kind });
 }
 function battleCommand(id) {
   if (!inBattle || battleBusy) return;
+  playSound("confirm");
   if (id === "fight") heroAction({ kind:"fight" });
   else if (id === "defend") heroAction({ kind:"defend" });
   else if (id === "items") { battleItemsOpen = true; battleItemCursor = 0; draw(); }
   else if (id === "run") doRun();
 }
 function winBattle() {
+  const enemyType = foe.type;
+  const endHp = S.hp;
+  const levelBefore = S.lv;
   const m = MONSTERS[foe.type];
   S.stats.wins++;
   S.exp += m.exp; S.gold += m.gold;
   const lines = [m.name + " を倒した！", m.exp + " EXP、" + m.gold + " G を手に入れた。"];
   while (S.lv < 3 && EXP_NEXT[S.lv] && S.exp >= EXP_NEXT[S.lv]) {
     S.lv++; S.hp += 6;
+    logEvent("levelup", { lv:S.lv });
     lines.push("レベルが " + S.lv + " に上がった！ 最大HP+6、攻撃力 " + heroAtk() + "。");
   }
+  playSound("victory");
+  if (S.lv > levelBefore) playSound("levelup");
   foe.inactive = true;
-  const wasBoss = foe.type === "king";
+  const wasBoss = enemyType === "king";
+  logBattleEnd("win", enemyType, endHp);
+  if (wasBoss) logEvent("boss_win");
   inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
   mode = "map";
   if (wasBoss) {
@@ -1158,6 +1493,8 @@ function winBattle() {
   }
 }
 function defeat() {
+  if (foe) logBattleEnd("wipe", foe.type, S.hp);
+  logEvent("wipe");
   inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
   mode = "map";
   S.stats.deaths++;
@@ -1169,6 +1506,7 @@ function defeat() {
 
 /* ============ Input: keyboard ============ */
 document.addEventListener("keydown", e => {
+  initAudio();
   lastPointer = false;
   const k = e.key;
   const isConfirm = (k === " " || k === "z" || k === "Z" || k === "Enter");
@@ -1182,14 +1520,14 @@ document.addEventListener("keydown", e => {
   if (mode === "battle") {
     if (battleItemsOpen) {
       const n = battleItems().length;
-      if (k === "ArrowUp" || k === "w" || k === "W") { battleItemCursor = (battleItemCursor + n - 1) % n; draw(); e.preventDefault(); }
-      else if (k === "ArrowDown" || k === "s" || k === "S") { battleItemCursor = (battleItemCursor + 1) % n; draw(); e.preventDefault(); }
+      if (k === "ArrowUp" || k === "w" || k === "W") { const before = battleItemCursor; battleItemCursor = (battleItemCursor + n - 1) % n; if (battleItemCursor !== before) playSound("cursor"); draw(); e.preventDefault(); }
+      else if (k === "ArrowDown" || k === "s" || k === "S") { const before = battleItemCursor; battleItemCursor = (battleItemCursor + 1) % n; if (battleItemCursor !== before) playSound("cursor"); draw(); e.preventDefault(); }
       else if (isConfirm) { useBattleItem(battleItemCursor); e.preventDefault(); }
-      else if (k === "Backspace" || k === "x" || k === "X" || k === "Escape") { battleItemsOpen = false; draw(); e.preventDefault(); }
+      else if (k === "Backspace" || k === "x" || k === "X" || k === "Escape") { playSound("cancel"); battleItemsOpen = false; draw(); e.preventDefault(); }
       return;
     }
-    if (k === "ArrowLeft" || k === "a" || k === "A") { battleCursor = (battleCursor + BCMDS.length - 1) % BCMDS.length; draw(); e.preventDefault(); }
-    else if (k === "ArrowRight" || k === "d" || k === "D") { battleCursor = (battleCursor + 1) % BCMDS.length; draw(); e.preventDefault(); }
+    if (k === "ArrowLeft" || k === "a" || k === "A") { battleCursor = (battleCursor + BCMDS.length - 1) % BCMDS.length; playSound("cursor"); draw(); e.preventDefault(); }
+    else if (k === "ArrowRight" || k === "d" || k === "D") { battleCursor = (battleCursor + 1) % BCMDS.length; playSound("cursor"); draw(); e.preventDefault(); }
     else if (isConfirm) { battleCommand(BCMDS[battleCursor].id); e.preventDefault(); }
     return;
   }
@@ -1201,7 +1539,10 @@ document.addEventListener("keydown", e => {
   if (dialogActive()) {
     if (dialogChoices) {
       if (k === "ArrowLeft" || k === "a" || k === "A" || k === "ArrowRight" || k === "d" || k === "D") {
-        dialogChoices.sel = (dialogChoices.sel + 1) % dialogChoices.options.length; draw(); e.preventDefault();
+        const before = dialogChoices.sel;
+        dialogChoices.sel = (dialogChoices.sel + 1) % dialogChoices.options.length;
+        if (dialogChoices.sel !== before) playSound("cursor");
+        draw(); e.preventDefault();
       } else if (isConfirm) { chooseDialogOption(dialogChoices.sel); e.preventDefault(); }
       return;
     }
@@ -1217,6 +1558,7 @@ document.addEventListener("keydown", e => {
 
 /* ============ Input: pointer (mouse / touch) — shown only after actual pointer use ============ */
 cv.addEventListener("pointerdown", e => {
+  initAudio();
   lastPointer = true;
   const p = toLogical(e);
   if (mode === "menu") { menuClick(p); return; }
@@ -1226,7 +1568,7 @@ cv.addEventListener("pointerdown", e => {
       for (let i = 0; i < list.length; i++) {
         if (inRect(p, 8, 160 + i * 16, 384, 16)) {
           if (battleItemCursor === i) useBattleItem(i);
-          else { battleItemCursor = i; draw(); }
+          else { battleItemCursor = i; playSound("cursor"); draw(); }
           return;
         }
       }
@@ -1236,7 +1578,7 @@ cv.addEventListener("pointerdown", e => {
       const r = cmdRect(i);
       if (inRect(p, r.x, r.y, r.w, r.h)) {
         if (battleCursor === i) battleCommand(BCMDS[i].id);
-        else { battleCursor = i; draw(); }
+        else { battleCursor = i; playSound("cursor"); draw(); }
         return;
       }
     }
@@ -1249,7 +1591,7 @@ cv.addEventListener("pointerdown", e => {
       if (inRect(p, 8, 184, 384, 48)) {
         const idx = Math.min(n - 1, Math.floor((p.x - 8) / 384 * n));
         if (dialogChoices.sel === idx) chooseDialogOption(idx);
-        else { dialogChoices.sel = idx; draw(); }
+        else { dialogChoices.sel = idx; playSound("cursor"); draw(); }
       }
       return;
     }
@@ -1268,6 +1610,7 @@ cv.addEventListener("pointerdown", e => {
 /* ============ Boot ============ */
 (async () => {
   const loaded = await loadGame();
+  await loadPlayLog();
   const KNOWN_MAPS = ["village", "field", "cave", "castle", "cave1", "cave2", "castle1", "castle2"];
   if (loaded && loaded.map && KNOWN_MAPS.indexOf(loaded.map) >= 0) {
     S = migrateSave(loaded);
@@ -1275,6 +1618,8 @@ cv.addEventListener("pointerdown", e => {
   }
   playStart = Date.now();
   spawnEnemies();
+  lastSheetId = currentSheet() ? currentSheet().id : null;
+  logEvent(loaded ? "load" : "start");
   draw();
   showDialog([S.cleared ? "（セーブデータを読み込んだ。クリア済みの世界だ）" : "（セーブデータを読み込んだ／新しい冒険）"]);
 })();
