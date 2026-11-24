@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>maou-rpg v0.7</title>
+<title>maou-rpg v0.8</title>
 <style>
   html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden; }
   body { display:flex; align-items:center; justify-content:center; }
@@ -438,10 +438,12 @@ function playSound(name, arg) {
 function heroMaxHp() { return LEVELS[S.lv].maxhp; }
 function heroAtk() { return LEVELS[S.lv].atk; }
 
-/* Enemies (v0.7, design §13): contact encounters, and trash mobs NEVER
-   disappear — winning or fleeing leaves the monster on its tile, fully
-   healed, and stepping into it again immediately starts a new battle
+/* Enemies (v0.7, design §13; v0.8, design §16): contact encounters, and
+   trash mobs NEVER disappear — winning or fleeing leaves the monster on
+   its tile, fully healed, and bumping into it again starts a new battle
    (continuous grinding is intended). There is no respawn unit at all.
+   Since v0.8 the hero never steps onto the enemy tile: the bump starts
+   the battle from the adjacent tile and the hero simply stays there.
    The only flag-controlled enemy is the boss: once defeated it stays
    gone (S.cleared). Gatekeeper-style enemies, if ever needed, will be
    controlled by flags, not by removing normal enemies. */
@@ -721,7 +723,7 @@ function formatCount(n) { return Number(n || 0).toLocaleString("en-US"); }
    mentions the hidden passage, the chest's second layer, or the sleep
    powder (not even after the powder is obtained). */
 function buildShareText() {
-  return "maou-rpg v0.7 / Lv" + S.lv +
+  return "maou-rpg v0.8 / Lv" + S.lv +
     " / プレイ時間 " + fmtTime(currentElapsed()) +
     " / 歩数 " + formatCount(S.stats.steps) +
     " / 勝利 " + S.stats.wins +
@@ -1075,7 +1077,7 @@ function wrapText(s, max) {
 function drawRecordMenu() {
   ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
   text("きろく", 16, 12, 15);
-  text("v0.7", 384, 14, 9, "#888", "right");
+  text("v0.8", 384, 14, 9, "#888", "right");
   const rows = [
     ["プレイ時間", fmtTime(currentElapsed()), "レベル", String(S.lv)],
     ["歩数", formatCount(S.stats.steps), "勝利", String(S.stats.wins)],
@@ -1115,7 +1117,7 @@ function drawMenu() {
   if (menuScreen === "record") { drawRecordMenu(); return; }
   ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
   text(SCREEN_TITLES[menuScreen], 16, 12, 15);
-  text("v0.7", 384, 14, 9, "#888", "right");
+  text("v0.8", 384, 14, 9, "#888", "right");
   if (menuScreen === "slots") {
     drawSlotList(46);
     if (saveResult) text(saveResult, 110, 204, 11, "#9fe870");
@@ -1266,33 +1268,76 @@ const DIRS = { up:[0,-1], down:[0,1], left:[-1,0], right:[1,0] };
    tile move animates in 4 sub-steps of 1/4 tile (~30ms each, linear, no
    easing — smooth, not overly smooth). The logical tile position commits
    only when the animation completes, and steps / sheet membership /
-   encounters / map transitions all resolve at that moment, at tile
-   granularity, exactly as the old instant movement did. While a move
-   animates, the only input taken is the latest direction (buffered for
-   the next tile); talk/menu inputs are ignored. Holding a direction
-   walks tile after tile; releasing it finishes the current tile. */
+   map transitions all resolve at that moment, at tile granularity,
+   exactly as the old instant movement did. While a move animates, the
+   only input taken is the latest direction (buffered for the next
+   tile); talk/menu inputs are ignored. Holding a direction walks tile
+   after tile; releasing it finishes the current tile. */
 const MOVE_STEPS = 4, MOVE_STEP_MS = 30;
 let moveAnim = null;   // {dx, dy, toX, toY, step}
 let moveTimer = null;
 let moveFx = 0, moveFy = 0; // fractional tile offset used by drawMap
 let heldDir = null;         // latest direction held/pressed (keyboard or D-pad)
 let pointerDir = null;      // direction currently held via the on-screen D-pad
-let battleFrom = null;      // tile the hero stepped into the current battle from
+/* Bump latch (v0.8, design §16): a bump interaction fires at most once
+   per continuous hold of a direction. The latch is set when a bump
+   fires, and cleared when that direction is released (keyup / pointer
+   up) or a different direction is pressed — so holding a key through a
+   dialog or a battle can never re-trigger the interaction in a loop,
+   while a fresh press (or a direction change) bumps again. */
+let bumpLatchDir = null;
 
 function requestMove(dir) {
   if (mode !== "map" || dialogActive()) return;
   heldDir = dir;
+  if (dir !== bumpLatchDir) bumpLatchDir = null; // direction changed: re-arm the bump
   if (moveAnim) return; // buffered: takes effect at the next tile boundary
   startMove(dir);
 }
 function startMove(dir) {
   S.dir = dir;
   const d = DIRS[dir], nx = S.x + d[0], ny = S.y + d[1];
-  if (isSolid(S.map, nx, ny)) { draw(); return; }
-  if (MAPS[S.map].npcs.some(n => n.x === nx && n.y === ny)) { draw(); return; }
+  /* Bump = interact (v0.8, design §16): a movement attempt into a
+     target tile NEVER moves the hero — no step-in, no 1/4-tile slide
+     toward it, zero displacement. An enemy starts a battle from the
+     adjacent tile the hero is standing on, an NPC starts a
+     conversation, and a registered inspectable object is examined, all
+     with exactly the same flow, sounds and log events as the confirm
+     key. Plain walls and other non-interactive blocked terrain do
+     nothing at all (no message, no sound). Nothing hidden under a
+     closed sheet can be bumped into interaction either: the cloth
+     leaks no information (same rule as confirm-key inspect). */
+  const foe = enemyAt(nx, ny);
+  if (foe) {
+    if (!isCovered(S.map, nx, ny)) tryBump(dir, () => startBattle(foe));
+    draw(); return;
+  }
+  const npc = MAPS[S.map].npcs.find(n => n.x === nx && n.y === ny);
+  if (npc) {
+    if (!isCovered(S.map, nx, ny)) tryBump(dir, () => startTalk(npc.lines, npc.id || "npc", npc.voice || "object"));
+    draw(); return;
+  }
+  if (isSolid(S.map, nx, ny)) {
+    if (isInspectableTile(S.map, nx, ny) && !isCovered(S.map, nx, ny)) tryBump(dir, () => inspectTileAt(nx, ny));
+    draw(); return;
+  }
   moveAnim = { dx:d[0], dy:d[1], toX:nx, toY:ny, step:0 };
   moveFx = 0; moveFy = 0;
   moveTimer = setTimeout(stepMoveAnim, MOVE_STEP_MS);
+}
+/* Fire a bump interaction at most once per continuous hold of dir. */
+function tryBump(dir, fn) {
+  if (bumpLatchDir === dir) return;
+  bumpLatchDir = dir;
+  fn();
+}
+/* Tiles that respond to facing + confirm (see inspectTileAt): the
+   church, the inn, the village shop, the chest, the cart, the note and
+   the hidden wall. Bumping into one runs the same inspection. */
+function isInspectableTile(map, x, y) {
+  const t = tileAt(map, x, y);
+  return t === "C" || t === "I" || t === "*" || t === "O" || t === "N" ||
+         (t === "S" && map === "village") || (t === "?" && map === "cave1");
 }
 function stepMoveAnim() {
   moveTimer = null;
@@ -1302,28 +1347,16 @@ function stepMoveAnim() {
   moveFy = moveAnim.dy * moveAnim.step / MOVE_STEPS;
   if (moveAnim.step < MOVE_STEPS) { draw(); moveTimer = setTimeout(stepMoveAnim, MOVE_STEP_MS); return; }
   // Commit the tile: everything below resolves exactly as a v0.6 step did.
-  const fromX = S.x, fromY = S.y;
   S.x = moveAnim.toX; S.y = moveAnim.toY;
   moveAnim = null; moveFx = 0; moveFy = 0;
   S.stats.steps++;
   updateSheetEntered();
   // Sheet visibility follows the new position automatically (v0.5).
-  const foe = enemyAt(S.x, S.y);
-  if (foe) { battleFrom = { x:fromX, y:fromY }; startBattle(foe); draw(); return; }
+  // There is no encounter check at tile commit any more (v0.8): enemy
+  // tiles are never entered — contact is a bump, handled in startMove.
   onStepTile(tileAt(S.map, S.x, S.y));
   saveQuiet(); draw();
   if (heldDir && mode === "map" && !dialogActive()) startMove(heldDir);
-}
-/* After a battle ends in a win or a flee, the hero steps back to the tile
-   they entered the battle from; the monster stays on its tile, fully
-   healed, and stepping into it again starts a fresh battle (§13). If a
-   battle somehow started without a step-in tile, the hero stays in place:
-   encounters trigger only on entering a tile, so nothing re-triggers
-   until the hero leaves that tile and steps back onto it. */
-function stepBackFromBattle() {
-  if (battleFrom) { S.x = battleFrom.x; S.y = battleFrom.y; }
-  battleFrom = null;
-  updateSheetEntered();
 }
 function facingPos() { const d = DIRS[S.dir]; return {x:S.x + d[0], y:S.y + d[1]}; }
 
@@ -1353,7 +1386,15 @@ function interact() {
   if (isCovered(S.map, f.x, f.y)) return;
   const npc = MAPS[S.map].npcs.find(n => n.x === f.x && n.y === f.y);
   if (npc) { startTalk(npc.lines, npc.id || "npc", npc.voice || "object"); return; }
-  const t = tileAt(S.map, f.x, f.y);
+  inspectTileAt(f.x, f.y);
+}
+
+/* Examine the tile at (x, y) on the current map. This is the confirm-key
+   inspection, and since v0.8 it is also what runs when the hero bumps
+   into the object (see startMove). Callers guarantee the tile is not
+   hidden under a closed sheet. */
+function inspectTileAt(x, y) {
+  const t = tileAt(S.map, x, y);
   if (t === "C") {
     saveQuiet();
     logEvent("save", { slot: currentSlot + 1 });
@@ -1390,7 +1431,7 @@ function interact() {
   } else if (t === "N") {
     startTalk(["壁に書き置きがある。", "「王が暴れたときのために、見張りには眠り粉を持たせておく。」"], "note", "object");
   } else if (t === "?" && S.map === "cave1") {
-    setTile("cave1", f.x, f.y, "P");
+    setTile("cave1", x, y, "P");
     S.secretOpen = true; logEvent("secret_open"); saveQuiet(); draw();
     startTalk(["調べると、壁がゴロゴロと動いた！", "隠し通路が開いた。"], "secret_wall", "object");
   }
@@ -1553,7 +1594,7 @@ function escapeBattle() {
   if (foe) logBattleEnd("flee", foe.type, S.hp);
   inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
   mode = "map";
-  stepBackFromBattle();
+  // v0.8: the hero never left the adjacent tile, so there is no step back.
   spawnEnemies();
   saveQuiet(); draw();
   showDialog(["勇者は逃げ出した。"]);
@@ -1629,7 +1670,7 @@ function winBattle() {
   inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
   mode = "map";
   if (wasBoss) S.cleared = true;
-  stepBackFromBattle();
+  // v0.8: the hero stayed on the adjacent tile for the whole battle.
   spawnEnemies(); // refresh: a defeated boss stays gone; trash mobs remain on their tiles
   if (wasBoss) {
     S.clearRecord = { timeMs: currentElapsed(), lv: S.lv, wins: S.stats.wins, steps: S.stats.steps, deaths: S.stats.deaths };
@@ -1652,7 +1693,6 @@ function defeat() {
   logEvent("wipe");
   inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
   mode = "map";
-  battleFrom = null;
   S.stats.deaths++;
   S.hp = heroMaxHp();
   S.map = "village"; S.x = 2; S.y = 3; S.dir = "down";
@@ -1727,8 +1767,9 @@ const KEY_DIRS = { ArrowUp:"up", w:"up", W:"up", ArrowDown:"down", s:"down", S:"
 document.addEventListener("keyup", e => {
   const dir = KEY_DIRS[e.key];
   if (dir && heldDir === dir) heldDir = null;
+  if (dir && dir === bumpLatchDir) bumpLatchDir = null; // released: the next press may bump again (v0.8)
 });
-function clearPointerDir() { if (pointerDir) { if (heldDir === pointerDir) heldDir = null; pointerDir = null; } }
+function clearPointerDir() { if (pointerDir) { if (heldDir === pointerDir) heldDir = null; if (pointerDir === bumpLatchDir) bumpLatchDir = null; pointerDir = null; } }
 window.addEventListener("pointerup", clearPointerDir);
 window.addEventListener("pointercancel", clearPointerDir);
 
@@ -1927,7 +1968,7 @@ function titleClick(p) {
 function drawTitle() {
   ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
   text("maou-rpg", 200, 34, 30, "#f0ead6", "center");
-  text("v0.7", 200, 72, 10, "#888", "center");
+  text("v0.8", 200, 72, 10, "#888", "center");
   if (titleScreen === "root") {
     const items = titleItems();
     items.forEach((it, i) => {
