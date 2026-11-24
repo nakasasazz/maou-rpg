@@ -2,49 +2,19 @@
 <html lang="ja">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>maou-rpg v0.1</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>maou-rpg v0.2</title>
 <style>
-  body { background:#101018; color:#f0ead6; font-family:"Hiragino Kaku Gothic ProN",sans-serif; text-align:center; margin:0; padding:12px; }
-  h1 { font-size:18px; margin:4px 0; letter-spacing:2px; }
-  #hud { font-size:15px; margin:6px auto; background:#1d1d2b; border:2px solid #555; display:inline-block; padding:6px 14px; border-radius:6px; }
-  #hud span { margin:0 7px; }
-  canvas { background:#000; border:3px solid #666; image-rendering:pixelated; max-width:96vw; height:auto; }
-  #msg { min-height:64px; max-width:620px; margin:8px auto; background:#141422; border:2px solid #777; border-radius:6px; padding:8px 12px; font-size:15px; text-align:left; white-space:pre-wrap; cursor:pointer; }
-  #choices { margin:6px auto; }
-  button { font-size:15px; padding:7px 16px; margin:3px; background:#2b2b44; color:#f0ead6; border:2px solid #888; border-radius:6px; cursor:pointer; }
-  button:hover { background:#3d3d5e; }
-  #battle { display:none; max-width:620px; margin:8px auto; background:#180f18; border:3px solid #a44; border-radius:8px; padding:10px; }
-  #battle canvas { border:2px solid #555; background:#20202e; }
-  .note { font-size:12px; color:#aaa; margin-top:6px; }
+  html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden; }
+  body { display:flex; align-items:center; justify-content:center; }
+  canvas { image-rendering:pixelated; display:block; touch-action:none; }
 </style>
 </head>
 <body>
-<h1>maou-rpg v0.1</h1>
-<div>
-  <span id="hud"></span>
-</div>
-<br>
-<canvas id="game" width="640" height="480"></canvas>
-
-<div id="battle">
-  <canvas id="bcanvas" width="192" height="192"></canvas>
-  <div id="blog" style="min-height:44px; margin:6px; font-size:15px; white-space:pre-wrap;"></div>
-  <div id="bcmds">
-    <button id="btnFight">たたかう</button>
-    <button id="btnHerb">やくそう</button>
-    <button id="btnRun">にげる</button>
-  </div>
-</div>
-
-<div id="msg">…</div>
-<div id="choices"></div>
-<button id="btnNew">ニューゲーム</button>
-<div class="note">移動：矢印キー / WASD　調べる・話す：Space / Z / Enter　セーブは IndexedDB に自動保存されます。</div>
-
+<canvas id="game" width="400" height="240"></canvas>
 <script>
 "use strict";
-/* ============ Sprites (ChatGPT design, 16x16 grids) ============ */
+/* ============ Sprites (ChatGPT design, 16x16 grids) — unchanged from v0.1 ============ */
 const PALETTE = {".":null, K:"#17202A", C:"#5DDCE7", S:"#2098B4", W:"#F7F5E8", P:"#8750C7", R:"#E85653", B:"#8C553A", G:"#58B76A", Y:"#F6C65B"};
 const SPRITES = {
   puni: ["................","................","......KKKK......","....KKCCCCKK....","...KCCCCCCCCK...","..KCCCCCCCCCCK..","..KCCWKCCWKCCK..",".KCCCWKCCWKCCCK.",".KCCCCCCCCCCCCK.",".KCCCCCCCCCCCCK.",".KCCCSSSSSSCCCK.","..KCCCCCCCCCCK..","..KCCCCCCCCCCK..","...KKCCCCCCKK...",".....KKKKKK.....","................"],
@@ -61,9 +31,7 @@ const MONSTERS = {
 const LEVELS = {1:{maxhp:28, atk:7}, 2:{maxhp:34, atk:9}, 3:{maxhp:40, atk:11}};
 const EXP_NEXT = {1:8, 2:22}; // Lv2 at EXP>=8, Lv3 at EXP>=22
 
-/* ============ Maps (string grids) ============ */
-/* Legend: # wall, . floor, T tree, C church, I inn, S shop, E exit, V village entrance,
-   D cave entrance, G castle gate, X cave back exit, ? secret wall, P secret portal, * chest */
+/* ============ Maps (string grids) — unchanged from v0.1 ============ */
 const MAPS = {
   village: {
     name:"はじまりの村", w:12, h:10,
@@ -173,7 +141,6 @@ const MAPS = {
     ]
   }
 };
-// Deep-copy grids so the secret wall can be mutated per session/save
 const grids = {};
 for (const k in MAPS) grids[k] = MAPS[k].grid.slice();
 
@@ -188,13 +155,13 @@ function setTile(map, x, y, ch) {
 const SOLID = "#TCIS*?";
 function isSolid(map, x, y) { return SOLID.indexOf(tileAt(map, x, y)) >= 0; }
 
-/* ============ State ============ */
+/* ============ State — same fields as v0.1 (save compatible) ============ */
 function freshState() {
   return { map:"village", x:6, y:8, dir:"down", lv:1, hp:LEVELS[1].maxhp, exp:0, gold:10,
            herbs:1, secretOpen:false, cleared:false, chestOpened:false };
 }
 let S = freshState();
-let activeEnemies = []; // enemies present on current map visit
+let activeEnemies = [];
 
 function heroMaxHp() { return LEVELS[S.lv].maxhp; }
 function heroAtk() { return LEVELS[S.lv].atk; }
@@ -208,7 +175,7 @@ function enemyAt(x, y) {
   return activeEnemies.find(e => !e.inactive && e.x === x && e.y === y);
 }
 
-/* ============ IndexedDB save ============ */
+/* ============ IndexedDB save — same db/store/key as v0.1 ============ */
 let dbPromise = null;
 function openDB() {
   if (!dbPromise) {
@@ -222,12 +189,15 @@ function openDB() {
   return dbPromise;
 }
 async function saveGame() {
-  try {
-    const db = await openDB();
+  const db = await openDB();
+  await new Promise((res, rej) => {
     const tx = db.transaction("save", "readwrite");
     tx.objectStore("save").put(JSON.parse(JSON.stringify(S)), "main");
-  } catch (e) { /* storage unavailable: game still runs */ }
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
 }
+function saveQuiet() { saveGame().catch(() => {}); }
 async function loadGame() {
   try {
     const db = await openDB();
@@ -245,58 +215,222 @@ async function deleteSave() {
   } catch (e) {}
 }
 
-/* ============ UI helpers ============ */
+/* ============ Vision (radius + LOS) ============ */
+const VISION_RADIUS = { village:5, cave:4, castle:4 }; // field: unlimited
+const SIGHT_BLOCKERS = "#?CIST";
+function blocksSight(map, x, y) { return SIGHT_BLOCKERS.indexOf(tileAt(map, x, y)) >= 0; }
+/* Grid raycast (Amanatides & Woo). The target tile itself is not tested,
+   so a wall is visible while tiles behind it are not. When the ray passes
+   exactly through a grid corner, both orthogonal neighbours are tested,
+   which prevents diagonal corner leaking. */
+function losClear(map, x0, y0, x1, y1) {
+  let x = x0, y = y0;
+  const dx = x1 - x0, dy = y1 - y0;
+  const stepX = Math.sign(dx), stepY = Math.sign(dy);
+  const tDeltaX = dx !== 0 ? Math.abs(1 / dx) : Infinity;
+  const tDeltaY = dy !== 0 ? Math.abs(1 / dy) : Infinity;
+  let tMaxX = dx !== 0 ? tDeltaX * 0.5 : Infinity;
+  let tMaxY = dy !== 0 ? tDeltaY * 0.5 : Infinity;
+  while (x !== x1 || y !== y1) {
+    if (Math.abs(tMaxX - tMaxY) < 1e-9) {
+      if (blocksSight(map, x + stepX, y) || blocksSight(map, x, y + stepY)) return false;
+      x += stepX; y += stepY; tMaxX += tDeltaX; tMaxY += tDeltaY;
+    } else if (tMaxX < tMaxY) {
+      x += stepX; tMaxX += tDeltaX;
+    } else {
+      y += stepY; tMaxY += tDeltaY;
+    }
+    if (x === x1 && y === y1) break;
+    if (blocksSight(map, x, y)) return false;
+  }
+  return true;
+}
+function isVisible(x, y) {
+  if (x === S.x && y === S.y) return true;
+  const r = VISION_RADIUS[S.map];
+  if (r === undefined) return true; // field: no limit inside the viewport
+  if (Math.abs(x - S.x) > r || Math.abs(y - S.y) > r) return false;
+  return losClear(S.map, S.x, S.y, x, y);
+}
+
+/* ============ Canvas setup: fixed 400x240 logical resolution ============ */
 const cv = document.getElementById("game"), ctx = cv.getContext("2d");
 ctx.imageSmoothingEnabled = false;
-const hudEl = document.getElementById("hud");
-const msgEl = document.getElementById("msg");
-const choicesEl = document.getElementById("choices");
-let dialogQueue = [];   // array of strings, shown one by one
-let pendingChoices = null; // {options:[{label,fn}]} shown after dialog empties
+const W = 400, H = 240, TILE = 16;
+const PLAYER_SX = 192, PLAYER_SY = 112; // tile 13th col / 8th row
+const HIDDEN_COLOR = "#05080D";
 
-function updateHUD() {
-  hudEl.innerHTML =
-    "<span>" + MAPS[S.map].name + "</span>" +
-    "<span>Lv " + S.lv + "</span>" +
-    "<span>HP " + S.hp + "/" + heroMaxHp() + "</span>" +
-    "<span>EXP " + S.exp + "</span>" +
-    "<span>" + S.gold + " G</span>" +
-    "<span>やくそう " + S.herbs + "個</span>" +
-    (S.cleared ? "<span>★クリア済み</span>" : "");
+function fitCanvas() {
+  const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  cv.style.width = (W * scale) + "px";
+  cv.style.height = (H * scale) + "px";
+}
+window.addEventListener("resize", fitCanvas);
+fitCanvas();
+
+function toLogical(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * W / r.width, y: (e.clientY - r.top) * H / r.height };
+}
+function inRect(p, x, y, w, h) { return p.x >= x && p.x < x + w && p.y >= y && p.y < y + h; }
+
+/* ============ Modes & UI state ============ */
+let mode = "map"; // "map" | "menu" | "battle"
+let lastPointer = false; // touch/pointer controls visibility heuristic
+let dialogPages = null;  // array of [line, line] pages, or null
+let dialogChoices = null; // {title, options:[{label,fn}], sel}
+let pendingChoices = null;
+
+/* ---------- dialog (map mode, bottom box only while active) ---------- */
+function wrapLine(text) {
+  const MAX = 30, out = [];
+  let t = text;
+  while (t.length > MAX) { out.push(t.substring(0, MAX)); t = t.substring(MAX); }
+  out.push(t);
+  return out;
 }
 function showDialog(lines, choices) {
-  dialogQueue = lines.slice();
+  const pages = [];
+  lines.forEach(ln => {
+    const w = wrapLine(ln);
+    for (let i = 0; i < w.length; i += 2) pages.push(w.slice(i, i + 2));
+  });
+  dialogPages = pages;
   pendingChoices = choices || null;
-  nextDialog();
+  dialogChoices = null;
+  draw();
 }
-function nextDialog() {
-  choicesEl.innerHTML = "";
-  if (dialogQueue.length > 0) {
-    msgEl.textContent = dialogQueue.shift() + "\n（クリック / Space で進む）";
-  } else if (pendingChoices) {
-    msgEl.textContent = pendingChoices.title || "どうする？";
-    pendingChoices.options.forEach(o => {
-      const b = document.createElement("button");
-      b.textContent = o.label;
-      b.onclick = () => { choicesEl.innerHTML = ""; msgEl.textContent = "…"; o.fn(); };
-      choicesEl.appendChild(b);
-    });
-    pendingChoices = null;
-  } else {
-    msgEl.textContent = "…";
+function dialogActive() { return dialogPages !== null || dialogChoices !== null; }
+function advanceDialog() {
+  if (dialogChoices) return; // choices need a selection, not advance
+  if (!dialogPages) return;
+  dialogPages.shift();
+  if (dialogPages.length === 0) {
+    dialogPages = null;
+    if (pendingChoices) {
+      dialogChoices = { title: pendingChoices.title, options: pendingChoices.options, sel: 0 };
+      pendingChoices = null;
+    }
+  }
+  draw();
+}
+function chooseDialogOption(i) {
+  const c = dialogChoices;
+  if (!c) return;
+  dialogChoices = null;
+  draw();
+  c.options[i].fn();
+}
+
+/* ---------- menu (hierarchical) ---------- */
+let menuScreen = "root"; // root | items | status | save | settings
+const menuCursors = { root:0, items:0, save:0, settings:0 };
+let soundOn = true;
+let saveResult = "";     // shown on save screen after a successful save
+let itemsNote = "";      // transient note replacing the item description
+let newGameArmed = false;
+
+const INVENTORY = [
+  { id:"herb", name:"やくそう", desc:"HPを16回復", count:() => S.herbs }
+];
+function rootItems() {
+  return [
+    { id:"items",    label:"どうぐ" },
+    { id:"status",   label:"つよさ" },
+    { id:"save",     label:"セーブ" },
+    { id:"settings", label:"せってい" },
+    { id:"back",     label:"もどる" }
+  ];
+}
+function settingsItems() {
+  return [
+    { id:"sound",   label:"おと " + (soundOn ? "ON" : "OFF"), desc:"おとの ON/OFF（いまは表示だけです）" },
+    { id:"newgame", label:"ニューゲーム", desc: newGameArmed ? "もう一度 決定すると、セーブを消して 最初からになります" : "セーブを消して 最初から やり直します" }
+  ];
+}
+function currentList() {
+  if (menuScreen === "root") return rootItems();
+  if (menuScreen === "items") return INVENTORY.map(it => ({ id:it.id, label: it.name + "  ×" + it.count(), desc: it.desc }));
+  if (menuScreen === "save") return [{ id:"save", label:"セーブする" }];
+  if (menuScreen === "settings") return settingsItems();
+  return []; // status: no selection
+}
+function openMenu() {
+  mode = "menu"; menuScreen = "root"; saveResult = ""; itemsNote = ""; newGameArmed = false;
+  draw();
+}
+function closeMenu() { mode = "map"; draw(); }
+function menuBack() {
+  if (menuScreen === "root") closeMenu();
+  else { menuScreen = "root"; newGameArmed = false; draw(); }
+}
+async function resetGame() {
+  await deleteSave();
+  S = freshState();
+  grids.cave = MAPS.cave.grid.slice();
+  spawnEnemies();
+  mode = "map"; menuScreen = "root"; newGameArmed = false;
+  saveQuiet();
+  showDialog(["新しい冒険が始まった。"]);
+  draw();
+}
+function menuConfirm() {
+  const list = currentList();
+  const cur = menuCursors[menuScreen] || 0;
+  const item = list[cur];
+  if (!item) return;
+  if (menuScreen === "root") {
+    if (item.id === "back") closeMenu();
+    else { menuScreen = item.id; saveResult = ""; itemsNote = ""; draw(); }
+  } else if (menuScreen === "items") {
+    if (item.id === "herb") {
+      if (S.herbs <= 0) { itemsNote = "やくそうが ない"; }
+      else if (S.hp >= heroMaxHp()) { itemsNote = "HPは まんたんだ"; }
+      else {
+        S.herbs--;
+        const healed = Math.min(16, heroMaxHp() - S.hp);
+        S.hp += healed;
+        itemsNote = "HPが " + healed + " 回復した";
+        saveQuiet();
+      }
+      draw();
+    }
+  } else if (menuScreen === "save") {
+    if (item.id === "save") {
+      saveResult = "";
+      saveGame().then(() => { saveResult = "セーブしました"; draw(); })
+                .catch(() => { saveResult = "セーブに失敗しました"; draw(); });
+    }
+  } else if (menuScreen === "settings") {
+    if (item.id === "sound") { soundOn = !soundOn; draw(); }
+    else if (item.id === "newgame") {
+      if (!newGameArmed) { newGameArmed = true; draw(); }
+      else resetGame();
+    }
   }
 }
-function dialogActive() { return dialogQueue.length > 0 || msgEl.textContent !== "…" || choicesEl.children.length > 0; }
-msgEl.addEventListener("click", () => { if (!inBattle) nextDialog(); });
+function menuMove(d) {
+  const list = currentList();
+  if (list.length === 0) return;
+  const n = list.length;
+  menuCursors[menuScreen] = ((menuCursors[menuScreen] || 0) + d + n) % n;
+  itemsNote = "";
+  if (menuScreen === "settings") newGameArmed = false;
+  draw();
+}
+function menuClick(p) {
+  if (inRect(p, 16, 206, 80, 26)) { menuBack(); return; }
+  const list = currentList();
+  for (let i = 0; i < list.length; i++) {
+    if (inRect(p, 32, 50 + i * 26, 336, 26)) {
+      if (menuCursors[menuScreen] === i) menuConfirm();
+      else { menuCursors[menuScreen] = i; itemsNote = ""; if (menuScreen === "settings") newGameArmed = false; draw(); }
+      return;
+    }
+  }
+}
 
-/* ============ Rendering ============ */
-const TILE = 32;
-const TILE_COLORS = {
-  village: {floor:"#d8c690", wall:"#7a4a2b", alt:"#cbb582"},
-  field:   {floor:"#3f9e4d", wall:"#6b6b6b", alt:"#379145"},
-  cave:    {floor:"#3a3a44", wall:"#17171f", alt:"#33333d"},
-  castle:  {floor:"#5a5470", wall:"#241f33", alt:"#524c66"}
-};
+/* ============ Drawing helpers ============ */
 function drawSprite(c, grid, cx, cy, size) {
   const px = size / 16;
   for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
@@ -304,69 +438,195 @@ function drawSprite(c, grid, cx, cy, size) {
     if (col) { c.fillStyle = col; c.fillRect(cx + x * px, cy + y * px, px, px); }
   }
 }
-function drawPerson(c, px, py, color) {
-  c.fillStyle = "#f2c894"; c.fillRect(px + 11, py + 5, 10, 9);      // head
-  c.fillStyle = "#17202A"; c.fillRect(px + 11, py + 3, 10, 4);      // hair
-  c.fillStyle = color;     c.fillRect(px + 9, py + 14, 14, 11);     // body
-  c.fillStyle = "#17202A"; c.fillRect(px + 10, py + 25, 5, 5); c.fillRect(px + 17, py + 25, 5, 5); // legs
+function drawPerson(c, px, py, color) { // fits one 16px tile
+  c.fillStyle = "#17202A"; c.fillRect(px + 5, py + 1, 6, 3);   // hair
+  c.fillStyle = "#f2c894"; c.fillRect(px + 5, py + 3, 6, 5);   // head
+  c.fillStyle = color;     c.fillRect(px + 4, py + 8, 8, 5);   // body
+  c.fillStyle = "#17202A"; c.fillRect(px + 5, py + 13, 2, 3); c.fillRect(px + 9, py + 13, 2, 3); // legs
 }
-function draw() {
-  const map = MAPS[S.map], pal = TILE_COLORS[S.map];
-  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, cv.width, cv.height);
-  const mw = map.w * TILE, mh = map.h * TILE;
-  let ox, oy;
-  if (mw <= cv.width) ox = (cv.width - mw) / 2;
-  else ox = Math.max(cv.width - mw, Math.min(0, cv.width / 2 - (S.x * TILE + TILE / 2)));
-  if (mh <= cv.height) oy = (cv.height - mh) / 2;
-  else oy = Math.max(cv.height - mh, Math.min(0, cv.height / 2 - (S.y * TILE + TILE / 2)));
+function box(x, y, w, h, fill) {
+  ctx.fillStyle = fill || "#101018";
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeStyle = "#f0ead6"; ctx.lineWidth = 2;
+  ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
+}
+function text(str, x, y, size, color, align) {
+  ctx.fillStyle = color || "#f0ead6";
+  ctx.font = (size || 12) + "px sans-serif";
+  ctx.textAlign = align || "left";
+  ctx.textBaseline = "top";
+  ctx.fillText(str, x, y);
+}
 
-  for (let y = 0; y < map.h; y++) for (let x = 0; x < map.w; x++) {
-    const t = tileAt(S.map, x, y), dx = ox + x * TILE, dy = oy + y * TILE;
-    ctx.fillStyle = ((x + y) % 2 === 0) ? pal.floor : pal.alt;
+/* ============ Map rendering ============ */
+const TILE_COLORS = {
+  village: {floor:"#d8c690", wall:"#7a4a2b", alt:"#cbb582"},
+  field:   {floor:"#3f9e4d", wall:"#6b6b6b", alt:"#379145"},
+  cave:    {floor:"#3a3a44", wall:"#17171f", alt:"#33333d"},
+  castle:  {floor:"#5a5470", wall:"#241f33", alt:"#524c66"}
+};
+const MENU_BTN = { x:328, y:4, w:68, h:20 };
+const DPAD = {
+  up:    { x:34, y:156, w:24, h:24, label:"▲" },
+  left:  { x:10, y:180, w:24, h:24, label:"◀" },
+  right: { x:58, y:180, w:24, h:24, label:"▶" },
+  down:  { x:34, y:204, w:24, h:24, label:"▼" }
+};
+const ABTN = { x:348, y:172, r:20 };
+
+function drawMap() {
+  const pal = TILE_COLORS[S.map];
+  ctx.fillStyle = HIDDEN_COLOR; ctx.fillRect(0, 0, W, H);
+  for (let sy = 0; sy < 15; sy++) for (let sx = 0; sx < 25; sx++) {
+    const mx = S.x + sx - 12, my = S.y + sy - 7;
+    const dx = sx * TILE, dy = sy * TILE;
+    if (mx < 0 || my < 0 || mx >= MAPS[S.map].w || my >= MAPS[S.map].h) continue; // out of map: dark
+    if (!isVisible(mx, my)) continue; // hidden: dark
+    const t = tileAt(S.map, mx, my);
+    ctx.fillStyle = ((mx + my) % 2 === 0) ? pal.floor : pal.alt;
     ctx.fillRect(dx, dy, TILE, TILE);
-    if (t === "#" || t === "?") {
-      ctx.fillStyle = (t === "?") ? "#22222c" : pal.wall;
-      ctx.fillRect(dx, dy, TILE, TILE);
-      ctx.fillStyle = "rgba(255,255,255,0.08)"; ctx.fillRect(dx, dy, TILE, 5);
+    if (t === "#" || t === "?") { // secret wall looks exactly like a normal wall
+      ctx.fillStyle = pal.wall; ctx.fillRect(dx, dy, TILE, TILE);
+      ctx.fillStyle = "rgba(255,255,255,0.08)"; ctx.fillRect(dx, dy, TILE, 3);
     } else if (t === "T") {
-      ctx.fillStyle = "#6b4a2b"; ctx.fillRect(dx + 13, dy + 18, 6, 10);
-      ctx.fillStyle = "#1e6b2e"; ctx.beginPath(); ctx.arc(dx + 16, dy + 13, 12, 0, 7); ctx.fill();
+      ctx.fillStyle = "#6b4a2b"; ctx.fillRect(dx + 7, dy + 9, 3, 6);
+      ctx.fillStyle = "#1e6b2e"; ctx.beginPath(); ctx.arc(dx + 8, dy + 7, 6, 0, 7); ctx.fill();
     } else if (t === "C" || t === "I" || t === "S") {
-      ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 2, dy + 8, 28, 22);
+      ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 1, dy + 5, 14, 11);
       ctx.fillStyle = t === "C" ? "#e8e4da" : (t === "I" ? "#c0392b" : "#2471a3");
-      ctx.beginPath(); ctx.moveTo(dx, dy + 10); ctx.lineTo(dx + 16, dy); ctx.lineTo(dx + 32, dy + 10); ctx.fill();
-      ctx.fillStyle = "#fff"; ctx.font = "bold 13px sans-serif"; ctx.textAlign = "center";
-      ctx.fillText(t === "C" ? "✚" : (t === "I" ? "宿" : "店"), dx + 16, dy + 25);
+      ctx.beginPath(); ctx.moveTo(dx, dy + 6); ctx.lineTo(dx + 8, dy); ctx.lineTo(dx + 16, dy + 6); ctx.fill();
+      text(t === "C" ? "✚" : (t === "I" ? "宿" : "店"), dx + 8, dy + 6, 8, "#fff", "center");
     } else if (t === "*") {
       if (!S.chestOpened) {
-        ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 5, dy + 11, 22, 15);
-        ctx.fillStyle = "#f6c65b"; ctx.fillRect(dx + 5, dy + 11, 22, 5); ctx.fillRect(dx + 14, dy + 11, 4, 15);
+        ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 3, dy + 6, 11, 8);
+        ctx.fillStyle = "#f6c65b"; ctx.fillRect(dx + 3, dy + 6, 11, 3); ctx.fillRect(dx + 7, dy + 6, 3, 8);
       }
     } else if (t === "P") {
       ctx.fillStyle = "#0a0a12"; ctx.fillRect(dx, dy, TILE, TILE);
-      ctx.fillStyle = "#8750c7"; ctx.fillRect(dx + 3, dy + 3, 3, 3); ctx.fillRect(dx + 26, dy + 24, 3, 3);
+      ctx.fillStyle = "#8750c7"; ctx.fillRect(dx + 2, dy + 2, 2, 2); ctx.fillRect(dx + 12, dy + 12, 2, 2);
     } else if (t === "D" || t === "X" || t === "E" || t === "V" || t === "G") {
-      ctx.fillStyle = "#14141c"; ctx.fillRect(dx + 4, dy + 4, 24, 24);
-      ctx.fillStyle = "#f6c65b"; ctx.font = "bold 12px sans-serif"; ctx.textAlign = "center";
-      ctx.fillText(t === "G" ? "門" : "↓", dx + 16, dy + 21);
+      ctx.fillStyle = "#14141c"; ctx.fillRect(dx + 2, dy + 2, 12, 12);
+      text(t === "G" ? "門" : "↓", dx + 8, dy + 4, 8, "#f6c65b", "center");
     }
   }
-  // NPCs
-  MAPS[S.map].npcs.forEach(n => drawPerson(ctx, ox + n.x * TILE, oy + n.y * TILE, n.color));
-  // Enemies (mini sprites)
-  activeEnemies.forEach(e => { if (!e.inactive) drawSprite(ctx, SPRITES[e.type], ox + e.x * TILE, oy + e.y * TILE, TILE); });
-  // Player (simple hero)
-  const px = ox + S.x * TILE, py = oy + S.y * TILE;
-  drawPerson(ctx, px, py, "#2456c7");
-  ctx.fillStyle = "#f6c65b"; ctx.fillRect(px + 11, py + 2, 10, 3); // circlet
-  updateHUD();
+  // NPCs / enemies: only when visible
+  MAPS[S.map].npcs.forEach(n => { if (isVisible(n.x, n.y)) drawPerson(ctx, PLAYER_SX + (n.x - S.x) * TILE, PLAYER_SY + (n.y - S.y) * TILE, n.color); });
+  activeEnemies.forEach(e => { if (!e.inactive && isVisible(e.x, e.y)) drawSprite(ctx, SPRITES[e.type], PLAYER_SX + (e.x - S.x) * TILE, PLAYER_SY + (e.y - S.y) * TILE, TILE); });
+  // Player: always at screen center
+  drawPerson(ctx, PLAYER_SX, PLAYER_SY, "#2456c7");
+  ctx.fillStyle = "#f6c65b"; ctx.fillRect(PLAYER_SX + 5, PLAYER_SY, 6, 2); // circlet
+  // Menu button (always visible on the map screen)
+  ctx.fillStyle = "rgba(16,16,24,0.85)"; ctx.fillRect(MENU_BTN.x, MENU_BTN.y, MENU_BTN.w, MENU_BTN.h);
+  ctx.strokeStyle = "#f0ead6"; ctx.lineWidth = 1; ctx.strokeRect(MENU_BTN.x + 0.5, MENU_BTN.y + 0.5, MENU_BTN.w - 1, MENU_BTN.h - 1);
+  text("メニュー", MENU_BTN.x + MENU_BTN.w / 2, MENU_BTN.y + 4, 11, "#f0ead6", "center");
+  // Touch controls (shown after pointer input)
+  if (lastPointer && !dialogActive()) {
+    ctx.globalAlpha = 0.75;
+    for (const k in DPAD) {
+      const b = DPAD[k];
+      ctx.fillStyle = "#2b2b44"; ctx.fillRect(b.x, b.y, b.w, b.h);
+      ctx.strokeStyle = "#f0ead6"; ctx.strokeRect(b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1);
+      text(b.label, b.x + b.w / 2, b.y + 6, 11, "#f0ead6", "center");
+    }
+    ctx.fillStyle = "#7a2b2b"; ctx.beginPath(); ctx.arc(ABTN.x, ABTN.y, ABTN.r, 0, 7); ctx.fill();
+    ctx.strokeStyle = "#f0ead6"; ctx.stroke();
+    text("A", ABTN.x, ABTN.y - 7, 13, "#fff", "center");
+    ctx.globalAlpha = 1;
+  }
+  // Dialog box (only while active)
+  if (dialogActive()) {
+    box(8, 184, 384, 48);
+    if (dialogChoices) {
+      text(dialogChoices.title || "どうする？", 18, 190, 12);
+      let ox = 18;
+      dialogChoices.options.forEach((o, i) => {
+        const label = (dialogChoices.sel === i ? "▶" : "　") + o.label;
+        text(label, ox, 210, 12, dialogChoices.sel === i ? "#f6c65b" : "#f0ead6");
+        ox += label.length * 12 + 18;
+      });
+    } else if (dialogPages && dialogPages.length > 0) {
+      dialogPages[0].forEach((ln, i) => text(ln, 18, 190 + i * 18, 12));
+      text("▼", 376, 214, 10, "#f0ead6", "center");
+    }
+  }
 }
 
-/* ============ Map transitions ============ */
+/* ============ Menu rendering ============ */
+const SCREEN_TITLES = { root:"メニュー", items:"どうぐ", status:"つよさ", save:"セーブ", settings:"せってい" };
+function drawMenu() {
+  ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
+  text(SCREEN_TITLES[menuScreen], 16, 12, 15);
+  text("v0.2", 384, 14, 9, "#888", "right");
+  const list = currentList();
+  const cur = menuCursors[menuScreen] || 0;
+  list.forEach((item, i) => {
+    const y = 50 + i * 26;
+    if (i === cur) text("▶", 32, y + 4, 13, "#f6c65b");
+    text(item.label, 52, y + 4, 13, i === cur ? "#fff" : "#cfc9b8");
+  });
+  if (menuScreen === "status") {
+    const lines = [
+      "レベル　　" + S.lv,
+      "HP　　　　" + S.hp + " / " + heroMaxHp(),
+      "こうげき　" + heroAtk(),
+      "けいけんち　" + S.exp,
+      "ゴールド　" + S.gold + " G",
+      "ばしょ　　" + MAPS[S.map].name
+    ];
+    lines.forEach((ln, i) => text(ln, 52, 54 + i * 26, 13));
+  }
+  if (menuScreen === "save" && saveResult) {
+    text(saveResult, 52, 50 + 26 + 8, 12, "#9fe870");
+  }
+  // Description pane: only the selected item's description
+  if (menuScreen === "items" || menuScreen === "settings") {
+    box(112, 190, 272, 42);
+    const item = list[cur];
+    const desc = menuScreen === "items" && itemsNote ? itemsNote : (item ? (item.desc || "") : "");
+    text(desc, 122, 204, 12);
+  }
+  // Back button: fixed bottom-left on every menu screen
+  ctx.fillStyle = "#2b2b44"; ctx.fillRect(16, 206, 80, 26);
+  ctx.strokeStyle = "#f0ead6"; ctx.lineWidth = 1; ctx.strokeRect(16.5, 206.5, 79, 25);
+  text("もどる", 56, 212, 12, "#f0ead6", "center");
+}
+
+/* ============ Battle rendering ============ */
+let battleMsg = "";
+const BCMDS = [
+  { id:"fight", label:"たたかう", x:12 },
+  { id:"herb",  label:"やくそう", x:140 },
+  { id:"run",   label:"にげる",  x:268 }
+];
+let battleCursor = 0;
+function drawBattle() {
+  ctx.fillStyle = "#180f18"; ctx.fillRect(0, 0, W, H);
+  if (foe) {
+    drawSprite(ctx, SPRITES[foe.type], 156, 10, 88);
+    text(MONSTERS[foe.type].name, 200, 104, 14, "#f0ead6", "center");
+  }
+  text("ゆうしゃ　HP " + Math.max(0, S.hp) + " / " + heroMaxHp(), 200, 126, 13, "#f0ead6", "center");
+  box(8, 146, 384, 50);
+  battleMsg.split("\n").slice(0, 2).forEach((ln, i) => text(ln, 18, 154 + i * 18, 12));
+  BCMDS.forEach((c, i) => {
+    ctx.fillStyle = i === battleCursor ? "#4a3b2b" : "#2b2b44";
+    ctx.fillRect(c.x, 204, 120, 28);
+    ctx.strokeStyle = "#f0ead6"; ctx.lineWidth = 1; ctx.strokeRect(c.x + 0.5, 204.5, 119, 27);
+    text((i === battleCursor ? "▶" : "") + c.label, c.x + 60, 211, 12, "#f0ead6", "center");
+  });
+}
+
+function draw() {
+  if (mode === "menu") drawMenu();
+  else if (mode === "battle") drawBattle();
+  else drawMap();
+}
+
+/* ============ Map transitions — unchanged from v0.1 ============ */
 function goTo(map, x, y) {
   S.map = map; S.x = x; S.y = y;
   spawnEnemies();
-  saveGame(); draw();
+  saveQuiet(); draw();
 }
 function onStepTile(t) {
   if (S.map === "village" && t === "E") goTo("field", 5, 24);
@@ -380,11 +640,10 @@ function onStepTile(t) {
   else if (S.map === "castle" && t === "G") goTo("field", 33, 7);
 }
 
-/* ============ Movement & interaction ============ */
+/* ============ Movement & interaction — logic unchanged from v0.1 ============ */
 const DIRS = { up:[0,-1], down:[0,1], left:[-1,0], right:[1,0] };
 function tryMove(dir) {
-  if (inBattle) return;
-  if (dialogActive()) { nextDialog(); return; }
+  if (mode !== "map" || dialogActive()) return;
   S.dir = dir;
   const d = DIRS[dir], nx = S.x + d[0], ny = S.y + d[1];
   if (isSolid(S.map, nx, ny)) { draw(); return; }
@@ -393,25 +652,25 @@ function tryMove(dir) {
   const foe = enemyAt(nx, ny);
   if (foe) { startBattle(foe); draw(); return; }
   onStepTile(tileAt(S.map, nx, ny));
-  saveGame(); draw();
+  saveQuiet(); draw();
 }
 function facingPos() { const d = DIRS[S.dir]; return {x:S.x + d[0], y:S.y + d[1]}; }
 function interact() {
-  if (inBattle) return;
-  if (dialogActive()) { nextDialog(); return; }
+  if (mode !== "map") return;
+  if (dialogActive()) { advanceDialog(); return; }
   const f = facingPos();
   const npc = MAPS[S.map].npcs.find(n => n.x === f.x && n.y === f.y);
   if (npc) { showDialog(npc.lines); return; }
   const t = tileAt(S.map, f.x, f.y);
   if (t === "C") {
-    saveGame();
+    saveQuiet();
     showDialog(["教会：「よくぞ来た。冒険の記録を神に届けておいたぞ。」", "（セーブしました）"]);
   } else if (t === "I") {
     showDialog(["宿屋：「一泊 8G だよ。ゆっくり休んでいきな。」"], {
       title:"宿屋：どうする？",
       options:[
         {label:"とまる（8G）", fn:() => {
-          if (S.gold >= 8) { S.gold -= 8; S.hp = heroMaxHp(); saveGame(); draw(); showDialog(["ぐっすり眠った。HPが全回復した！"]); }
+          if (S.gold >= 8) { S.gold -= 8; S.hp = heroMaxHp(); saveQuiet(); draw(); showDialog(["ぐっすり眠った。HPが全回復した！"]); }
           else showDialog(["お金が足りないようだ。"]);
         }},
         {label:"やめる", fn:() => showDialog(["宿屋：「また来な。」"])}
@@ -421,135 +680,181 @@ function interact() {
       title:"道具屋：どうする？",
       options:[
         {label:"やくそうを買う（6G）", fn:() => {
-          if (S.gold >= 6) { S.gold -= 6; S.herbs++; saveGame(); draw(); showDialog(["やくそうを 1個 買った。（現在 " + S.herbs + "個）"]); }
+          if (S.gold >= 6) { S.gold -= 6; S.herbs++; saveQuiet(); draw(); showDialog(["やくそうを 1個 買った。（現在 " + S.herbs + "個）"]); }
           else showDialog(["お金が足りないようだ。"]);
         }},
         {label:"やめる", fn:() => showDialog(["道具屋：「まいど。」"])}
       ]});
   } else if (t === "*") {
     if (!S.chestOpened) {
-      S.chestOpened = true; S.herbs++; saveGame(); draw();
+      S.chestOpened = true; S.herbs++; saveQuiet(); draw();
       showDialog(["宝箱を開けた！ やくそうを 1個 手に入れた。（現在 " + S.herbs + "個）"]);
     } else showDialog(["宝箱は空っぽだ。"]);
   } else if (t === "?" && S.map === "cave") {
-    // Secret wall: opens when checked (stand at 2,6 facing left is the natural spot)
     setTile("cave", f.x, f.y, "P");
-    S.secretOpen = true; saveGame(); draw();
+    S.secretOpen = true; saveQuiet(); draw();
     showDialog(["調べると、壁がゴロゴロと動いた！", "隠し通路が開いた。"]);
   }
 }
 
-/* ============ Battle ============ */
-let inBattle = false, foe = null, foeHp = 0, battleTurn = 0;
-const battleEl = document.getElementById("battle");
-const blogEl = document.getElementById("blog");
-const bcv = document.getElementById("bcanvas"), bctx = bcv.getContext("2d");
-bctx.imageSmoothingEnabled = false;
-
+/* ============ Battle — rules unchanged from v0.1, display trimmed ============ */
+let inBattle = false, foe = null, foeHp = 0, battleBusy = false;
+function setBattleMsg(t) { battleMsg = t; if (mode === "battle") draw(); }
 function startBattle(enemy) {
-  inBattle = true; foe = enemy; battleTurn = 0;
+  inBattle = true; foe = enemy; battleBusy = false; battleCursor = 0;
   foeHp = MONSTERS[enemy.type].hp;
-  battleEl.style.display = "block";
-  bctx.fillStyle = "#20202e"; bctx.fillRect(0, 0, 192, 192);
-  drawSprite(bctx, SPRITES[enemy.type], 32, 32, 128);
+  mode = "battle";
   const m = MONSTERS[enemy.type];
-  let txt = m.name + " が あらわれた！（HP " + foeHp + "）";
+  let txt = m.name + " が あらわれた！";
   if (enemy.type === "bat") {
-    S.hp -= m.atk; battleTurn = 1;
-    txt += "\nバットンの先制攻撃！ " + m.atk + " のダメージ！（HP " + Math.max(0, S.hp) + "）";
-    if (S.hp <= 0) { blogEl.textContent = txt; setTimeout(defeat, 900); return; }
-  }
-  blogEl.textContent = txt;
-  updateHUD();
+    S.hp -= m.atk;
+    txt += "\nバットンの先制攻撃！ " + m.atk + " のダメージ！";
+    setBattleMsg(txt);
+    if (S.hp <= 0) { battleBusy = true; setTimeout(defeat, 900); return; }
+  } else setBattleMsg(txt);
+  draw();
 }
 function enemyAttack() {
   const m = MONSTERS[foe.type];
   S.hp -= m.atk;
-  let txt = m.name + " の攻撃！ " + m.atk + " のダメージ！（HP " + Math.max(0, S.hp) + "/" + heroMaxHp() + "）";
-  if (S.hp <= 0) { blogEl.textContent = txt; setTimeout(defeat, 900); return; }
-  blogEl.textContent = txt;
-  updateHUD();
+  setBattleMsg(m.name + " の攻撃！\n" + m.atk + " のダメージ！");
+  if (S.hp <= 0) { setTimeout(defeat, 900); return; }
+  battleBusy = false;
 }
 function winBattle() {
   const m = MONSTERS[foe.type];
   S.exp += m.exp; S.gold += m.gold;
-  let txt = m.name + " を倒した！ " + m.exp + " EXP、" + m.gold + " G を手に入れた。";
-  // Level up check (cap Lv3)
+  const lines = [m.name + " を倒した！", m.exp + " EXP、" + m.gold + " G を手に入れた。"];
   while (S.lv < 3 && EXP_NEXT[S.lv] && S.exp >= EXP_NEXT[S.lv]) {
     S.lv++; S.hp += 6;
-    txt += "\nレベルが " + S.lv + " に上がった！ 最大HP+6、攻撃力 " + heroAtk() + "。";
+    lines.push("レベルが " + S.lv + " に上がった！ 最大HP+6、攻撃力 " + heroAtk() + "。");
   }
   foe.inactive = true;
   const wasBoss = foe.type === "king";
-  inBattle = false; foe = null;
-  battleEl.style.display = "none";
-  saveGame(); draw();
+  inBattle = false; foe = null; battleBusy = false;
+  mode = "map";
+  saveQuiet(); draw();
   if (wasBoss) {
-    S.cleared = true; saveGame(); draw();
-    showDialog([txt, "魔王ゴブリンキングを倒した！", "世界に平和が戻った…… v0.1 クリア！ おめでとう。"]);
+    S.cleared = true; saveQuiet();
+    showDialog(lines.concat(["魔王ゴブリンキングを倒した！", "世界に平和が戻った…… v0.2 クリア！ おめでとう。"]));
   } else {
-    showDialog([txt]);
+    showDialog(lines);
   }
 }
 function defeat() {
-  inBattle = false; foe = null;
-  battleEl.style.display = "none";
+  inBattle = false; foe = null; battleBusy = false;
+  mode = "map";
   S.hp = heroMaxHp();
   S.map = "village"; S.x = 2; S.y = 3; S.dir = "down";
-  spawnEnemies(); saveGame(); draw();
-  showDialog(["勇者は死んでしまった……", "教会で目を覚ました。HPは全回復している。（EXPとゴールドは失われていない）"]);
+  spawnEnemies(); saveQuiet(); draw();
+  showDialog(["勇者は死んでしまった……", "教会で目を覚ました。HPは全回復している。", "（EXPとゴールドは失われていない）"]);
 }
-document.getElementById("btnFight").onclick = () => {
-  if (!inBattle) return;
-  battleTurn++;
+function battleCommand(id) {
+  if (!inBattle || battleBusy) return;
   const m = MONSTERS[foe.type];
-  let dmg = heroAtk(); let crit = false;
-  if (Math.random() < 0.10) { dmg *= 2; crit = true; }
-  foeHp -= dmg;
-  let txt = "勇者の攻撃！" + (crit ? " かいしんの一撃！" : "") + " " + dmg + " のダメージ！";
-  if (foeHp <= 0) { blogEl.textContent = txt; setTimeout(winBattle, 700); return; }
-  txt += "（敵HP " + foeHp + "）";
-  blogEl.textContent = txt;
-  setTimeout(enemyAttack, 700);
-};
-document.getElementById("btnHerb").onclick = () => {
-  if (!inBattle) return;
-  if (S.herbs <= 0) { blogEl.textContent = "やくそうがない！"; return; }
-  S.herbs--;
-  const healed = Math.min(16, heroMaxHp() - S.hp);
-  S.hp += healed;
-  blogEl.textContent = "やくそうを使った。HPが " + healed + " 回復した！（HP " + S.hp + "/" + heroMaxHp() + "）";
-  updateHUD();
-  setTimeout(enemyAttack, 700);
-};
-document.getElementById("btnRun").onclick = () => {
-  if (!inBattle) return;
-  if (foe.type === "king") { blogEl.textContent = "魔王からは逃げられない！"; return; }
-  foe.inactive = true; // stays inactive until map re-entry
-  inBattle = false; foe = null;
-  battleEl.style.display = "none";
-  saveGame(); draw();
-  showDialog(["勇者は逃げ出した。"]);
-};
+  if (id === "fight") {
+    battleBusy = true;
+    let dmg = heroAtk(); let crit = false;
+    if (Math.random() < 0.10) { dmg *= 2; crit = true; }
+    foeHp -= dmg;
+    setBattleMsg((crit ? "かいしんの一撃！" : "勇者の攻撃！") + "\n" + dmg + " のダメージ！");
+    if (foeHp <= 0) { setTimeout(winBattle, 800); return; }
+    setTimeout(enemyAttack, 800);
+  } else if (id === "herb") {
+    if (S.herbs <= 0) { setBattleMsg("やくそうが ない！"); return; }
+    battleBusy = true;
+    S.herbs--;
+    const healed = Math.min(16, heroMaxHp() - S.hp);
+    S.hp += healed;
+    setBattleMsg("やくそうを使った。\nHPが " + healed + " 回復した！");
+    setTimeout(enemyAttack, 800);
+  } else if (id === "run") {
+    if (foe.type === "king") { setBattleMsg("魔王からは逃げられない！"); return; }
+    foe.inactive = true;
+    inBattle = false; foe = null;
+    mode = "map";
+    saveQuiet(); draw();
+    showDialog(["勇者は逃げ出した。"]);
+  }
+}
 
-/* ============ Input ============ */
+/* ============ Input: keyboard ============ */
 document.addEventListener("keydown", e => {
+  lastPointer = false;
   const k = e.key;
+  const isConfirm = (k === " " || k === "z" || k === "Z" || k === "Enter");
+  if (mode === "menu") {
+    if (k === "ArrowUp" || k === "w" || k === "W") { menuMove(-1); e.preventDefault(); }
+    else if (k === "ArrowDown" || k === "s" || k === "S") { menuMove(1); e.preventDefault(); }
+    else if (k === "Enter" || k === "z" || k === "Z") { menuConfirm(); e.preventDefault(); }
+    else if (k === "Backspace" || k === "x" || k === "X" || k === "Escape") { menuBack(); e.preventDefault(); }
+    return;
+  }
+  if (mode === "battle") {
+    if (k === "ArrowLeft" || k === "a" || k === "A") { battleCursor = (battleCursor + BCMDS.length - 1) % BCMDS.length; draw(); e.preventDefault(); }
+    else if (k === "ArrowRight" || k === "d" || k === "D") { battleCursor = (battleCursor + 1) % BCMDS.length; draw(); e.preventDefault(); }
+    else if (isConfirm) { battleCommand(BCMDS[battleCursor].id); e.preventDefault(); }
+    return;
+  }
+  // map mode
+  if (k === "x" || k === "X" || k === "Escape") {
+    if (!dialogActive()) { openMenu(); e.preventDefault(); }
+    return;
+  }
+  if (dialogActive()) {
+    if (dialogChoices) {
+      if (k === "ArrowLeft" || k === "a" || k === "A" || k === "ArrowRight" || k === "d" || k === "D") {
+        dialogChoices.sel = (dialogChoices.sel + 1) % dialogChoices.options.length; draw(); e.preventDefault();
+      } else if (isConfirm) { chooseDialogOption(dialogChoices.sel); e.preventDefault(); }
+      return;
+    }
+    if (isConfirm) { advanceDialog(); e.preventDefault(); }
+    return;
+  }
   if (k === "ArrowUp" || k === "w" || k === "W") { tryMove("up"); e.preventDefault(); }
   else if (k === "ArrowDown" || k === "s" || k === "S") { tryMove("down"); e.preventDefault(); }
   else if (k === "ArrowLeft" || k === "a" || k === "A") { tryMove("left"); e.preventDefault(); }
   else if (k === "ArrowRight" || k === "d" || k === "D") { tryMove("right"); e.preventDefault(); }
-  else if (k === " " || k === "z" || k === "Z" || k === "Enter") { interact(); e.preventDefault(); }
+  else if (isConfirm) { interact(); e.preventDefault(); }
 });
-document.getElementById("btnNew").onclick = async () => {
-  await deleteSave();
-  S = freshState();
-  grids.cave = MAPS.cave.grid.slice(); // restore secret wall
-  spawnEnemies();
-  msgEl.textContent = "…"; choicesEl.innerHTML = "";
-  saveGame(); draw();
-  showDialog(["新しい冒険が始まった。"]);
-};
+
+/* ============ Input: pointer (mouse / touch) ============ */
+cv.addEventListener("pointerdown", e => {
+  lastPointer = true;
+  const p = toLogical(e);
+  if (mode === "menu") { menuClick(p); return; }
+  if (mode === "battle") {
+    for (let i = 0; i < BCMDS.length; i++) {
+      if (inRect(p, BCMDS[i].x, 204, 120, 28)) {
+        if (battleCursor === i) battleCommand(BCMDS[i].id);
+        else { battleCursor = i; draw(); }
+        return;
+      }
+    }
+    return;
+  }
+  // map mode
+  if (dialogActive()) {
+    if (dialogChoices) {
+      // options are laid out from x=18; split the box into halves
+      const idx = p.x < W / 2 ? 0 : Math.min(1, dialogChoices.options.length - 1);
+      if (inRect(p, 8, 184, 384, 48)) {
+        if (dialogChoices.sel === idx) chooseDialogOption(idx);
+        else { dialogChoices.sel = idx; draw(); }
+      }
+      return;
+    }
+    advanceDialog();
+    return;
+  }
+  if (inRect(p, MENU_BTN.x, MENU_BTN.y, MENU_BTN.w, MENU_BTN.h)) { openMenu(); return; }
+  for (const key in DPAD) {
+    const b = DPAD[key];
+    if (inRect(p, b.x, b.y, b.w, b.h)) { tryMove(key); return; }
+  }
+  const ddx = p.x - ABTN.x, ddy = p.y - ABTN.y;
+  if (ddx * ddx + ddy * ddy <= ABTN.r * ABTN.r) { interact(); return; }
+});
 
 /* ============ Boot ============ */
 (async () => {
