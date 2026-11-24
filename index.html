@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>maou-rpg v0.6</title>
+<title>maou-rpg v0.7</title>
 <style>
   html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden; }
   body { display:flex; align-items:center; justify-content:center; }
@@ -333,8 +333,16 @@ async function loadPlayLog() {
   } catch (e) { /* an absent/corrupt log simply starts empty */ }
   logDirty = false;
 }
+/* t must be monotonic within a session: the elapsed base restarts when
+   a (different) save is loaded or a new game starts, which in v0.6 let a
+   'start' event carry a smaller t than the preceding 'load'. Clamp to
+   the last emitted t so the session's event stream never goes backwards. */
+let lastLogT = 0;
 function logEvent(type, fields) {
-  const ev = { t: Math.max(0, Math.round(currentElapsed())), type:type };
+  let t = Math.max(0, Math.round(currentElapsed()));
+  if (t < lastLogT) t = lastLogT;
+  lastLogT = t;
+  const ev = { t: t, type:type };
   if (fields) Object.assign(ev, fields);
   playLog.events.push(ev);
   if (playLog.events.length > LOG_CAP) {
@@ -430,26 +438,20 @@ function playSound(name, arg) {
 function heroMaxHp() { return LEVELS[S.lv].maxhp; }
 function heroAtk() { return LEVELS[S.lv].atk; }
 
-/* Enemy respawn unit = the whole dungeon (v0.4): enemy states are kept
-   per map, and a dungeon group's states are reset only when the hero
-   enters that group from outside it. Moving cave1<->cave2 or
-   castle1<->castle2 therefore does NOT respawn normal enemies and does
-   not clear flee-inactivity; going out to the field (or crossing between
-   cave and castle) does. The boss never respawns once defeated. */
-const DUNGEON_GROUP = { cave1:"cave", cave2:"cave", castle1:"castle", castle2:"castle" };
-function groupOf(map) { return DUNGEON_GROUP[map] || map; }
-let enemyStates = {}; // map -> [{type,x,y,inactive}]
-function freshEnemies(map) {
-  return MAPS[map].enemies
-    .filter(e => !(e.type === "king" && S.cleared))
-    .map(e => ({type:e.type, x:e.x, y:e.y, inactive:false}));
-}
+/* Enemies (v0.7, design §13): contact encounters, and trash mobs NEVER
+   disappear — winning or fleeing leaves the monster on its tile, fully
+   healed, and stepping into it again immediately starts a new battle
+   (continuous grinding is intended). There is no respawn unit at all.
+   The only flag-controlled enemy is the boss: once defeated it stays
+   gone (S.cleared). Gatekeeper-style enemies, if ever needed, will be
+   controlled by flags, not by removing normal enemies. */
 function spawnEnemies() {
-  if (!enemyStates[S.map]) enemyStates[S.map] = freshEnemies(S.map);
-  activeEnemies = enemyStates[S.map];
+  activeEnemies = MAPS[S.map].enemies
+    .filter(e => !(e.type === "king" && S.cleared))
+    .map(e => ({type:e.type, x:e.x, y:e.y}));
 }
 function enemyAt(x, y) {
-  return activeEnemies.find(e => !e.inactive && e.x === x && e.y === y);
+  return activeEnemies.find(e => e.x === x && e.y === y);
 }
 
 /* ============ IndexedDB save — same db/store/key as v0.1/v0.2 ============ */
@@ -465,20 +467,53 @@ function openDB() {
   }
   return dbPromise;
 }
-async function saveGame() {
-  const snap = JSON.parse(JSON.stringify(S));
-  snap.stats.elapsedMs = currentElapsed();
+/* Save slots (v0.7, design §12): 20 slots under IDB key "saves" as
+   {slots:[saveObject|null x20], lastSlot}. The current slot is where
+   autosaves and church saves go; the menu's セーブ screen can write to
+   any slot (and makes it the current one). A legacy v0.1-v0.6 save under
+   key "main" migrates into slot 1 on first boot. */
+const SLOT_COUNT = 20;
+let savesData = { slots: new Array(SLOT_COUNT).fill(null), lastSlot: 0 };
+let currentSlot = 0;
+async function persistSaves() {
   const db = await openDB();
+  const snap = JSON.parse(JSON.stringify(savesData));
   await new Promise((res, rej) => {
     const tx = db.transaction("save", "readwrite");
-    tx.objectStore("save").put(snap, "main");
+    tx.objectStore("save").put(snap, "saves");
     tx.oncomplete = () => res();
     tx.onerror = () => rej(tx.error);
   });
+}
+async function loadSaves() {
+  try {
+    const rec = await idbGet("saves");
+    if (rec && Array.isArray(rec.slots)) {
+      savesData = { slots: rec.slots.slice(0, SLOT_COUNT), lastSlot: (typeof rec.lastSlot === "number") ? rec.lastSlot : 0 };
+      while (savesData.slots.length < SLOT_COUNT) savesData.slots.push(null);
+      if (savesData.lastSlot < 0 || savesData.lastSlot >= SLOT_COUNT) savesData.lastSlot = 0;
+      return;
+    }
+  } catch (e) { /* fall through to legacy migration */ }
+  savesData = { slots: new Array(SLOT_COUNT).fill(null), lastSlot: 0 };
+  const legacy = await loadGame();
+  if (legacy) {
+    savesData.slots[0] = legacy;
+    savesData.lastSlot = 0;
+    try { await persistSaves(); } catch (e) {}
+  }
+}
+async function saveGame() {
+  const snap = JSON.parse(JSON.stringify(S));
+  snap.stats.elapsedMs = currentElapsed();
+  savesData.slots[currentSlot] = snap;
+  savesData.lastSlot = currentSlot;
+  await persistSaves();
   S.stats.elapsedMs = snap.stats.elapsedMs;
   playStart = Date.now();
 }
 function saveQuiet() { saveGame().catch(() => {}); }
+/* Legacy single-save reader (key "main"), used only for the v0.7 slot migration. */
 async function loadGame() {
   try {
     const db = await openDB();
@@ -496,12 +531,6 @@ async function idbGet(key) {
     rq.onsuccess = () => res(rq.result || null);
     rq.onerror = () => res(null);
   });
-}
-async function deleteSave() {
-  try {
-    const db = await openDB();
-    db.transaction("save", "readwrite").objectStore("save").delete("main");
-  } catch (e) {}
 }
 
 /* ============ Vision (v0.4, v0.5 rule) ============
@@ -531,7 +560,7 @@ function toLogical(e) {
 function inRect(p, x, y, w, h) { return p.x >= x && p.x < x + w && p.y >= y && p.y < y + h; }
 
 /* ============ Modes & UI state ============ */
-let mode = "map"; // "map" | "menu" | "battle"
+let mode = "map"; // "title" | "map" | "menu" | "battle"
 let lastPointer = false; // on-screen controls shown only after actual pointer use
 let dialogPages = null;
 let dialogChoices = null;
@@ -593,13 +622,59 @@ function chooseDialogOption(i) {
 }
 
 /* ---------- menu (hierarchical) ---------- */
-let menuScreen = "root"; // root | items | status | record | save | settings
+let menuScreen = "root"; // root | items | status | record | slots | settings
 const menuCursors = { root:0, items:0, record:0, save:0, settings:0 };
 let saveResult = "";
 let itemsNote = "";
 let recordNote = "";
 let recordPaneText = "";
 let newGameArmed = false;
+
+/* Slot-list UI state, shared by the title screen (continue / new game)
+   and the in-game セーブ screen.
+   slotCtx: {purpose:"continue"|"newgame"|"save", cursor, top};
+   slotConfirm: overwrite confirmation (title はじめから on an occupied
+   slot only); sel 0=はい, 1=いいえ (defaults to いいえ). */
+let slotCtx = null;
+let slotConfirm = null;
+let slotGeom = { y0: 48 };
+const SLOT_ROWS = 8;
+const SLOT_ROW_H = 19;
+function adjustSlotScroll() {
+  if (!slotCtx) return;
+  if (slotCtx.cursor < slotCtx.top) slotCtx.top = slotCtx.cursor;
+  if (slotCtx.cursor >= slotCtx.top + SLOT_ROWS) slotCtx.top = slotCtx.cursor - SLOT_ROWS + 1;
+  if (slotCtx.top < 0) slotCtx.top = 0;
+  if (slotCtx.top > SLOT_COUNT - SLOT_ROWS) slotCtx.top = SLOT_COUNT - SLOT_ROWS;
+}
+function slotMove(d) {
+  if (!slotCtx) return;
+  const before = slotCtx.cursor;
+  slotCtx.cursor = Math.max(0, Math.min(SLOT_COUNT - 1, before + d));
+  if (slotCtx.cursor !== before) playSound("cursor");
+  adjustSlotScroll();
+}
+function slotLabel(i) {
+  const s = savesData.slots[i];
+  if (!s) return (i + 1) + "．（あき）";
+  const area = (MAPS[s.map] && MAPS[s.map].name) || s.map || "";
+  const t = (s.stats && typeof s.stats.elapsedMs === "number") ? s.stats.elapsedMs : 0;
+  return (i + 1) + "．Lv" + (s.lv || 1) + "　" + fmtTime(t) + "　" + area;
+}
+function drawSlotList(y0) {
+  slotGeom = { y0: y0 };
+  if (!slotCtx) return;
+  for (let r = 0; r < SLOT_ROWS; r++) {
+    const idx = slotCtx.top + r;
+    if (idx >= SLOT_COUNT) break;
+    const y = y0 + r * SLOT_ROW_H;
+    const occupied = !!savesData.slots[idx];
+    if (idx === slotCtx.cursor) text("▶", 32, y + 2, 12, "#f6c65b");
+    text(slotLabel(idx), 52, y + 2, 11, idx === slotCtx.cursor ? "#fff" : (occupied ? "#cfc9b8" : "#777"));
+  }
+  if (slotCtx.top > 0) text("▲", 378, y0, 9, "#888", "center");
+  if (slotCtx.top + SLOT_ROWS < SLOT_COUNT) text("▼", 378, y0 + (SLOT_ROWS - 1) * SLOT_ROW_H, 9, "#888", "center");
+}
 
 function inventoryList() {
   const list = [
@@ -630,16 +705,15 @@ function recordItems() {
 function settingsItems() {
   return [
     { id:"sound",   label:"おと " + (S.soundOn ? "ON" : "OFF"), desc:"おとの ON/OFF" },
-    { id:"newgame", label:"ニューゲーム", desc: newGameArmed ? "もう一度 決定すると、セーブを消して 最初からになります" : "セーブを消して 最初から やり直します" }
+    { id:"newgame", label:"ニューゲーム", desc: newGameArmed ? "もう一度 決定すると、いまのスロットを消して 最初からになります" : "いまのスロットを 最初から やり直します（他のスロットは残ります）" }
   ];
 }
 function currentList() {
   if (menuScreen === "root") return rootItems();
   if (menuScreen === "items") return inventoryList();
   if (menuScreen === "record") return recordItems();
-  if (menuScreen === "save") return [{ id:"save", label:"セーブする" }];
   if (menuScreen === "settings") return settingsItems();
-  return []; // status: no selection
+  return []; // status & slots: no generic selection list
 }
 /* ---------- play history: share text & log export ---------- */
 function formatCount(n) { return Number(n || 0).toLocaleString("en-US"); }
@@ -647,7 +721,7 @@ function formatCount(n) { return Number(n || 0).toLocaleString("en-US"); }
    mentions the hidden passage, the chest's second layer, or the sleep
    powder (not even after the powder is obtained). */
 function buildShareText() {
-  return "maou-rpg v0.6 / Lv" + S.lv +
+  return "maou-rpg v0.7 / Lv" + S.lv +
     " / プレイ時間 " + fmtTime(currentElapsed()) +
     " / 歩数 " + formatCount(S.stats.steps) +
     " / 勝利 " + S.stats.wins +
@@ -703,20 +777,30 @@ function menuBack() {
   else { menuScreen = "root"; newGameArmed = false; draw(); }
 }
 async function resetGame() {
-  await deleteSave();
+  // Settings ニューゲーム: restart the CURRENT slot only; other slots keep their data.
   S = freshState();
   for (const k in MAPS) grids[k] = MAPS[k].grid.slice();
-  enemyStates = {};
   playStart = Date.now();
   spawnEnemies();
   lastSheetId = currentSheet() ? currentSheet().id : null;
   mode = "map"; menuScreen = "root"; newGameArmed = false;
-  logEvent("start");
+  logEvent("start", { slot: currentSlot + 1 });
   saveQuiet();
   showDialog(["新しい冒険が始まった。"]);
   draw();
 }
 function menuConfirm() {
+  if (menuScreen === "slots") {
+    if (!slotCtx) return;
+    playSound("confirm");
+    const idx = slotCtx.cursor;
+    currentSlot = idx;
+    saveResult = "";
+    saveGame().then(() => { logEvent("save", { slot: idx + 1 }); saveResult = "セーブしました"; draw(); })
+              .catch(() => { saveResult = "セーブに失敗しました"; draw(); });
+    draw();
+    return;
+  }
   const list = currentList();
   const cur = menuCursors[menuScreen] || 0;
   const item = list[cur];
@@ -724,7 +808,10 @@ function menuConfirm() {
   if (menuScreen === "root" && item.id === "back") { menuBack(); return; }
   playSound("confirm");
   if (menuScreen === "root") {
-    menuScreen = item.id; saveResult = ""; itemsNote = ""; recordNote = ""; recordPaneText = ""; draw();
+    menuScreen = (item.id === "save") ? "slots" : item.id;
+    saveResult = ""; itemsNote = ""; recordNote = ""; recordPaneText = "";
+    if (menuScreen === "slots") { slotCtx = { purpose:"save", cursor: currentSlot, top: 0 }; adjustSlotScroll(); }
+    draw();
   } else if (menuScreen === "record") {
     if (item.id === "copy") copyShareText();
     else if (item.id === "export") exportPlayLog();
@@ -747,12 +834,6 @@ function menuConfirm() {
       itemsNote = "戦闘中に使うものだ。";
       draw();
     }
-  } else if (menuScreen === "save") {
-    if (item.id === "save") {
-      saveResult = "";
-      saveGame().then(() => { logEvent("save"); saveResult = "セーブしました"; draw(); })
-                .catch(() => { saveResult = "セーブに失敗しました"; draw(); });
-    }
   } else if (menuScreen === "settings") {
     if (item.id === "sound") {
       const wasOn = S.soundOn;
@@ -768,6 +849,7 @@ function menuConfirm() {
   }
 }
 function menuMove(d) {
+  if (menuScreen === "slots") { slotMove(d); saveResult = ""; draw(); return; }
   const list = currentList();
   if (list.length === 0) return;
   const n = list.length;
@@ -781,6 +863,19 @@ function menuMove(d) {
 }
 function menuClick(p) {
   if (inRect(p, 16, 206, 80, 26)) { menuBack(); return; }
+  if (menuScreen === "slots") {
+    if (!slotCtx) return;
+    for (let r = 0; r < SLOT_ROWS; r++) {
+      const idx = slotCtx.top + r;
+      if (idx >= SLOT_COUNT) break;
+      if (inRect(p, 28, slotGeom.y0 + r * SLOT_ROW_H, 344, SLOT_ROW_H)) {
+        if (slotCtx.cursor === idx) menuConfirm();
+        else { slotCtx.cursor = idx; playSound("cursor"); saveResult = ""; adjustSlotScroll(); draw(); }
+        return;
+      }
+    }
+    return;
+  }
   const list = currentList();
   const baseY = (menuScreen === "record") ? 148 : 50;
   for (let i = 0; i < list.length; i++) {
@@ -899,22 +994,27 @@ function drawMap() {
   const ts = indoor ? 32 : 16;                    // tile display size
   const pox = indoor ? 184 : 192, poy = indoor ? 104 : 112; // player tile top-left (hero centered)
   const rx = indoor ? 6 : 12, ryu = indoor ? 4 : 7, ryd = indoor ? 3 : 7;
+  // Smooth movement (v0.7): while a tile move animates, the world is
+  // drawn shifted by the fractional sub-tile offset (moveFx/moveFy);
+  // the hero sprite stays at screen center and glides with the world.
+  // The tile loop gets a 1-tile margin so the shift never exposes a gap.
+  const ox = S.x + moveFx, oy = S.y + moveFy;
   ctx.fillStyle = HIDDEN_COLOR; ctx.fillRect(0, 0, W, H);
-  for (let my = S.y - ryu; my <= S.y + ryd; my++) for (let mx = S.x - rx; mx <= S.x + rx; mx++) {
-    const dx = pox + (mx - S.x) * ts, dy = poy + (my - S.y) * ts;
+  for (let my = S.y - ryu - 1; my <= S.y + ryd + 1; my++) for (let mx = S.x - rx - 1; mx <= S.x + rx + 1; mx++) {
+    const dx = pox + (mx - ox) * ts, dy = poy + (my - oy) * ts;
     if (mx < 0 || my < 0 || mx >= MAPS[S.map].w || my >= MAPS[S.map].h) continue; // out of map: dark
     drawTile(tileAt(S.map, mx, my), dx, dy, ts, pal, mx, my);
   }
   // NPCs / enemies: never drawn while hidden under a closed sheet
-  MAPS[S.map].npcs.forEach(n => { if (!isCovered(S.map, n.x, n.y)) drawPerson(ctx, pox + (n.x - S.x) * ts, poy + (n.y - S.y) * ts, n.color, ts); });
-  activeEnemies.forEach(e => { if (!e.inactive && !isCovered(S.map, e.x, e.y)) drawSprite(ctx, SPRITES[e.type], pox + (e.x - S.x) * ts, poy + (e.y - S.y) * ts, ts); });
+  MAPS[S.map].npcs.forEach(n => { if (!isCovered(S.map, n.x, n.y)) drawPerson(ctx, pox + (n.x - ox) * ts, poy + (n.y - oy) * ts, n.color, ts); });
+  activeEnemies.forEach(e => { if (!isCovered(S.map, e.x, e.y)) drawSprite(ctx, SPRITES[e.type], pox + (e.x - ox) * ts, poy + (e.y - oy) * ts, ts); });
   // Closed sheets: opaque dark blue-grey cloth with a lattice pattern.
   // Drawn over terrain and objects, under the hero. No icon, no animation,
   // and the chest's sheet looks exactly like every other sheet. A sheet is
   // drawn only while the hero is NOT inside it (v0.5).
   for (const sh of SHEETS) {
     if (sh.map !== S.map || isSheetOpen(sh)) continue;
-    const dx = pox + (sh.x0 - S.x) * ts, dy = poy + (sh.y0 - S.y) * ts;
+    const dx = pox + (sh.x0 - ox) * ts, dy = poy + (sh.y0 - oy) * ts;
     const sw = (sh.x1 - sh.x0 + 1) * ts, shh = (sh.y1 - sh.y0 + 1) * ts;
     ctx.fillStyle = "#293344"; ctx.fillRect(dx, dy, sw, shh);
     ctx.strokeStyle = "#354356"; ctx.lineWidth = 1;
@@ -964,7 +1064,7 @@ function drawMap() {
 }
 
 /* ============ Menu rendering ============ */
-const SCREEN_TITLES = { root:"メニュー", items:"どうぐ", status:"つよさ", record:"きろく", save:"セーブ", settings:"せってい" };
+const SCREEN_TITLES = { root:"メニュー", items:"どうぐ", status:"つよさ", record:"きろく", slots:"セーブ", settings:"せってい" };
 function wrapText(s, max) {
   const out = [];
   let t = String(s);
@@ -975,7 +1075,7 @@ function wrapText(s, max) {
 function drawRecordMenu() {
   ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
   text("きろく", 16, 12, 15);
-  text("v0.6", 384, 14, 9, "#888", "right");
+  text("v0.7", 384, 14, 9, "#888", "right");
   const rows = [
     ["プレイ時間", fmtTime(currentElapsed()), "レベル", String(S.lv)],
     ["歩数", formatCount(S.stats.steps), "勝利", String(S.stats.wins)],
@@ -1015,7 +1115,15 @@ function drawMenu() {
   if (menuScreen === "record") { drawRecordMenu(); return; }
   ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
   text(SCREEN_TITLES[menuScreen], 16, 12, 15);
-  text("v0.6", 384, 14, 9, "#888", "right");
+  text("v0.7", 384, 14, 9, "#888", "right");
+  if (menuScreen === "slots") {
+    drawSlotList(46);
+    if (saveResult) text(saveResult, 110, 204, 11, "#9fe870");
+    ctx.fillStyle = "#2b2b44"; ctx.fillRect(16, 206, 80, 26);
+    ctx.strokeStyle = "#f0ead6"; ctx.lineWidth = 1; ctx.strokeRect(16.5, 206.5, 79, 25);
+    text("もどる", 56, 212, 12, "#f0ead6", "center");
+    return;
+  }
   const list = currentList();
   const cur = menuCursors[menuScreen] || 0;
   list.forEach((item, i) => {
@@ -1033,9 +1141,6 @@ function drawMenu() {
       "ばしょ　　" + MAPS[S.map].name
     ];
     lines.forEach((ln, i) => text(ln, 52, 54 + i * 26, 13));
-  }
-  if (menuScreen === "save" && saveResult) {
-    text(saveResult, 52, 50 + 26 + 8, 12, "#9fe870");
   }
   // Description pane: only the selected item's description
   if (menuScreen === "items" || menuScreen === "settings") {
@@ -1110,7 +1215,8 @@ function drawBattle() {
 }
 
 function draw() {
-  if (mode === "menu") drawMenu();
+  if (mode === "title") drawTitle();
+  else if (mode === "menu") drawMenu();
   else if (mode === "battle") drawBattle();
   else drawMap();
 }
@@ -1118,9 +1224,6 @@ function draw() {
 /* ============ Map transitions ============ */
 function goTo(map, x, y) {
   const from = S.map;
-  // Entering a dungeon group from outside it respawns that group's enemies.
-  const pg = groupOf(S.map), ng = groupOf(map);
-  if (pg !== ng) for (const m in MAPS) if (groupOf(m) === ng) enemyStates[m] = freshEnemies(m);
   S.map = map; S.x = x; S.y = y;
   spawnEnemies();
   if (from !== map) {
@@ -1159,20 +1262,68 @@ function onStepTile(t) {
 
 /* ============ Movement & interaction ============ */
 const DIRS = { up:[0,-1], down:[0,1], left:[-1,0], right:[1,0] };
-function tryMove(dir) {
+/* Smooth movement (v0.7, design §14): the input unit stays 1 tile, but a
+   tile move animates in 4 sub-steps of 1/4 tile (~30ms each, linear, no
+   easing — smooth, not overly smooth). The logical tile position commits
+   only when the animation completes, and steps / sheet membership /
+   encounters / map transitions all resolve at that moment, at tile
+   granularity, exactly as the old instant movement did. While a move
+   animates, the only input taken is the latest direction (buffered for
+   the next tile); talk/menu inputs are ignored. Holding a direction
+   walks tile after tile; releasing it finishes the current tile. */
+const MOVE_STEPS = 4, MOVE_STEP_MS = 30;
+let moveAnim = null;   // {dx, dy, toX, toY, step}
+let moveTimer = null;
+let moveFx = 0, moveFy = 0; // fractional tile offset used by drawMap
+let heldDir = null;         // latest direction held/pressed (keyboard or D-pad)
+let pointerDir = null;      // direction currently held via the on-screen D-pad
+let battleFrom = null;      // tile the hero stepped into the current battle from
+
+function requestMove(dir) {
   if (mode !== "map" || dialogActive()) return;
+  heldDir = dir;
+  if (moveAnim) return; // buffered: takes effect at the next tile boundary
+  startMove(dir);
+}
+function startMove(dir) {
   S.dir = dir;
   const d = DIRS[dir], nx = S.x + d[0], ny = S.y + d[1];
   if (isSolid(S.map, nx, ny)) { draw(); return; }
   if (MAPS[S.map].npcs.some(n => n.x === nx && n.y === ny)) { draw(); return; }
-  S.x = nx; S.y = ny;
+  moveAnim = { dx:d[0], dy:d[1], toX:nx, toY:ny, step:0 };
+  moveFx = 0; moveFy = 0;
+  moveTimer = setTimeout(stepMoveAnim, MOVE_STEP_MS);
+}
+function stepMoveAnim() {
+  moveTimer = null;
+  if (!moveAnim) return;
+  moveAnim.step++;
+  moveFx = moveAnim.dx * moveAnim.step / MOVE_STEPS;
+  moveFy = moveAnim.dy * moveAnim.step / MOVE_STEPS;
+  if (moveAnim.step < MOVE_STEPS) { draw(); moveTimer = setTimeout(stepMoveAnim, MOVE_STEP_MS); return; }
+  // Commit the tile: everything below resolves exactly as a v0.6 step did.
+  const fromX = S.x, fromY = S.y;
+  S.x = moveAnim.toX; S.y = moveAnim.toY;
+  moveAnim = null; moveFx = 0; moveFy = 0;
   S.stats.steps++;
   updateSheetEntered();
   // Sheet visibility follows the new position automatically (v0.5).
-  const foe = enemyAt(nx, ny);
-  if (foe) { startBattle(foe); draw(); return; }
-  onStepTile(tileAt(S.map, nx, ny));
+  const foe = enemyAt(S.x, S.y);
+  if (foe) { battleFrom = { x:fromX, y:fromY }; startBattle(foe); draw(); return; }
+  onStepTile(tileAt(S.map, S.x, S.y));
   saveQuiet(); draw();
+  if (heldDir && mode === "map" && !dialogActive()) startMove(heldDir);
+}
+/* After a battle ends in a win or a flee, the hero steps back to the tile
+   they entered the battle from; the monster stays on its tile, fully
+   healed, and stepping into it again starts a fresh battle (§13). If a
+   battle somehow started without a step-in tile, the hero stays in place:
+   encounters trigger only on entering a tile, so nothing re-triggers
+   until the hero leaves that tile and steps back onto it. */
+function stepBackFromBattle() {
+  if (battleFrom) { S.x = battleFrom.x; S.y = battleFrom.y; }
+  battleFrom = null;
+  updateSheetEntered();
 }
 function facingPos() { const d = DIRS[S.dir]; return {x:S.x + d[0], y:S.y + d[1]}; }
 
@@ -1205,7 +1356,7 @@ function interact() {
   const t = tileAt(S.map, f.x, f.y);
   if (t === "C") {
     saveQuiet();
-    logEvent("save");
+    logEvent("save", { slot: currentSlot + 1 });
     startTalk(["教会：「よくぞ来た。冒険の記録を神に届けておいたぞ。」", "（セーブしました）"], "church", "object");
   } else if (t === "I") {
     startTalk(["宿屋：「無料だよ。ゆっくり休んでいきな。」"], "inn", "object", {
@@ -1382,6 +1533,7 @@ function heroAction(action) {
   battleBusy = true;
   battleTurns++;
   S.stats.battleTurns++;
+  if (foe) logEvent("battle_act", { enemy:foe.type, act:(action.kind === "fight" ? "attack" : (action.kind === "defend" ? "defend" : "item:" + action.kind)), turn:battleTurns });
   /* Bat preemptive strike: defend and sleep powder resolve BEFORE it;
      every other first action lets the bat strike first (that strike is
      the bat's action for the turn). */
@@ -1399,9 +1551,10 @@ function heroAction(action) {
 }
 function escapeBattle() {
   if (foe) logBattleEnd("flee", foe.type, S.hp);
-  foe.inactive = true;
   inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
   mode = "map";
+  stepBackFromBattle();
+  spawnEnemies();
   saveQuiet(); draw();
   showDialog(["勇者は逃げ出した。"]);
 }
@@ -1410,6 +1563,7 @@ function doRun() {
   if (foe.type === "king") { setBattleMsg("魔王からは逃げられない！"); return; }
   battleTurns++;
   S.stats.battleTurns++;
+  logEvent("battle_act", { enemy:foe.type, act:"flee", turn:battleTurns });
   if (batPreempt) {
     batPreempt = false; batFirstTurn = false; battleBusy = true;
     playSound("hit");
@@ -1469,14 +1623,15 @@ function winBattle() {
   }
   playSound("victory");
   if (S.lv > levelBefore) playSound("levelup");
-  foe.inactive = true;
   const wasBoss = enemyType === "king";
   logBattleEnd("win", enemyType, endHp);
   if (wasBoss) logEvent("boss_win");
   inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
   mode = "map";
+  if (wasBoss) S.cleared = true;
+  stepBackFromBattle();
+  spawnEnemies(); // refresh: a defeated boss stays gone; trash mobs remain on their tiles
   if (wasBoss) {
-    S.cleared = true;
     S.clearRecord = { timeMs: currentElapsed(), lv: S.lv, wins: S.stats.wins, steps: S.stats.steps, deaths: S.stats.deaths };
     saveQuiet(); draw();
     showDialog(lines.concat([
@@ -1497,6 +1652,7 @@ function defeat() {
   logEvent("wipe");
   inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
   mode = "map";
+  battleFrom = null;
   S.stats.deaths++;
   S.hp = heroMaxHp();
   S.map = "village"; S.x = 2; S.y = 3; S.dir = "down";
@@ -1510,6 +1666,7 @@ document.addEventListener("keydown", e => {
   lastPointer = false;
   const k = e.key;
   const isConfirm = (k === " " || k === "z" || k === "Z" || k === "Enter");
+  if (mode === "title") { handleTitleKey(k, isConfirm); e.preventDefault(); return; }
   if (mode === "menu") {
     if (k === "ArrowUp" || k === "w" || k === "W") { menuMove(-1); e.preventDefault(); }
     else if (k === "ArrowDown" || k === "s" || k === "S") { menuMove(1); e.preventDefault(); }
@@ -1532,6 +1689,15 @@ document.addEventListener("keydown", e => {
     return;
   }
   // map mode
+  if (moveAnim) {
+    // Mid-tile: buffer the latest direction only; talk/menu inputs are ignored.
+    if (k === "ArrowUp" || k === "w" || k === "W") heldDir = "up";
+    else if (k === "ArrowDown" || k === "s" || k === "S") heldDir = "down";
+    else if (k === "ArrowLeft" || k === "a" || k === "A") heldDir = "left";
+    else if (k === "ArrowRight" || k === "d" || k === "D") heldDir = "right";
+    e.preventDefault();
+    return;
+  }
   if (k === "x" || k === "X" || k === "Escape") {
     if (!dialogActive()) { openMenu(); e.preventDefault(); }
     return;
@@ -1549,18 +1715,29 @@ document.addEventListener("keydown", e => {
     if (isConfirm) { advanceDialog(); e.preventDefault(); }
     return;
   }
-  if (k === "ArrowUp" || k === "w" || k === "W") { tryMove("up"); e.preventDefault(); }
-  else if (k === "ArrowDown" || k === "s" || k === "S") { tryMove("down"); e.preventDefault(); }
-  else if (k === "ArrowLeft" || k === "a" || k === "A") { tryMove("left"); e.preventDefault(); }
-  else if (k === "ArrowRight" || k === "d" || k === "D") { tryMove("right"); e.preventDefault(); }
+  if (k === "ArrowUp" || k === "w" || k === "W") { requestMove("up"); e.preventDefault(); }
+  else if (k === "ArrowDown" || k === "s" || k === "S") { requestMove("down"); e.preventDefault(); }
+  else if (k === "ArrowLeft" || k === "a" || k === "A") { requestMove("left"); e.preventDefault(); }
+  else if (k === "ArrowRight" || k === "d" || k === "D") { requestMove("right"); e.preventDefault(); }
   else if (isConfirm) { interact(); e.preventDefault(); }
 });
+
+/* Releasing a direction key stops the walk after the current tile. */
+const KEY_DIRS = { ArrowUp:"up", w:"up", W:"up", ArrowDown:"down", s:"down", S:"down", ArrowLeft:"left", a:"left", A:"left", ArrowRight:"right", d:"right", D:"right" };
+document.addEventListener("keyup", e => {
+  const dir = KEY_DIRS[e.key];
+  if (dir && heldDir === dir) heldDir = null;
+});
+function clearPointerDir() { if (pointerDir) { if (heldDir === pointerDir) heldDir = null; pointerDir = null; } }
+window.addEventListener("pointerup", clearPointerDir);
+window.addEventListener("pointercancel", clearPointerDir);
 
 /* ============ Input: pointer (mouse / touch) — shown only after actual pointer use ============ */
 cv.addEventListener("pointerdown", e => {
   initAudio();
   lastPointer = true;
   const p = toLogical(e);
+  if (mode === "title") { titleClick(p); return; }
   if (mode === "menu") { menuClick(p); return; }
   if (mode === "battle") {
     if (battleItemsOpen) {
@@ -1585,6 +1762,13 @@ cv.addEventListener("pointerdown", e => {
     return;
   }
   // map mode
+  if (moveAnim) {
+    for (const key in DPAD) {
+      const b = DPAD[key];
+      if (inRect(p, b.x, b.y, b.w, b.h)) { heldDir = key; pointerDir = key; return; }
+    }
+    return;
+  }
   if (dialogActive()) {
     if (dialogChoices) {
       const n = dialogChoices.options.length;
@@ -1601,27 +1785,178 @@ cv.addEventListener("pointerdown", e => {
   if (inRect(p, MENU_BTN.x, MENU_BTN.y, MENU_BTN.w, MENU_BTN.h)) { openMenu(); return; }
   for (const key in DPAD) {
     const b = DPAD[key];
-    if (inRect(p, b.x, b.y, b.w, b.h)) { tryMove(key); return; }
+    if (inRect(p, b.x, b.y, b.w, b.h)) { pointerDir = key; requestMove(key); return; }
   }
   const ddx = p.x - ABTN.x, ddy = p.y - ABTN.y;
   if (ddx * ddx + ddy * ddy <= ABTN.r * ABTN.r) { interact(); return; }
 });
 
-/* ============ Boot ============ */
-(async () => {
-  const loaded = await loadGame();
-  await loadPlayLog();
-  const KNOWN_MAPS = ["village", "field", "cave", "castle", "cave1", "cave2", "castle1", "castle2"];
-  if (loaded && loaded.map && KNOWN_MAPS.indexOf(loaded.map) >= 0) {
-    S = migrateSave(loaded);
+/* ============ Title screen & slot selection (v0.7) ============
+   Boot lands on a title screen: 「つづきからはじめる」 (only when some
+   slot holds data) and 「はじめから」, both leading to the 20-slot list.
+   Starting はじめから on an occupied slot asks for overwrite
+   confirmation first. Loading or starting a slot is what logs the
+   session's 'load' / 'start' event (with its 1-based slot number), and
+   the session time base (playStart) is reset before that logging. */
+let titleScreen = "root"; // root | slots
+let titleCursor = 0;
+function titleItems() {
+  const any = savesData.slots.some(s => !!s);
+  return any
+    ? [{ id:"continue", label:"つづきからはじめる" }, { id:"new", label:"はじめから" }]
+    : [{ id:"new", label:"はじめから" }];
+}
+function beginInSlot(idx, isNew) {
+  currentSlot = idx;
+  savesData.lastSlot = idx;
+  for (const k in MAPS) grids[k] = MAPS[k].grid.slice();
+  if (isNew) {
+    S = freshState();
+  } else {
+    S = migrateSave(JSON.parse(JSON.stringify(savesData.slots[idx])));
+    if (!MAPS[S.map]) { S.map = "village"; S.x = 6; S.y = 8; }
     if (S.secretOpen) setTile("cave1", 1, 6, "P");
   }
   playStart = Date.now();
   spawnEnemies();
   lastSheetId = currentSheet() ? currentSheet().id : null;
-  logEvent(loaded ? "load" : "start");
+  mode = "map"; menuScreen = "root"; newGameArmed = false;
+  slotCtx = null; slotConfirm = null;
+  if (isNew) {
+    logEvent("start", { slot: idx + 1 });
+    saveQuiet();
+    showDialog(["新しい冒険が始まった。"]);
+  } else {
+    logEvent("load", { slot: idx + 1 });
+    persistSaves().catch(() => {});
+    showDialog([S.cleared ? "（セーブデータを読み込んだ。クリア済みの世界だ）" : "（セーブデータを読み込んだ）"]);
+  }
   draw();
-  showDialog([S.cleared ? "（セーブデータを読み込んだ。クリア済みの世界だ）" : "（セーブデータを読み込んだ／新しい冒険）"]);
+}
+function titleRootActivate() {
+  const it = titleItems()[titleCursor];
+  if (!it) return;
+  playSound("confirm");
+  slotCtx = { purpose: (it.id === "continue" ? "continue" : "newgame"), cursor: Math.max(0, Math.min(SLOT_COUNT - 1, savesData.lastSlot)), top: 0 };
+  adjustSlotScroll();
+  titleScreen = "slots";
+  draw();
+}
+function titleSlotSelect() {
+  if (!slotCtx) return;
+  const idx = slotCtx.cursor;
+  const occupied = !!savesData.slots[idx];
+  if (slotCtx.purpose === "continue") {
+    if (!occupied) { playSound("cancel"); return; }
+    playSound("confirm");
+    beginInSlot(idx, false);
+  } else { // newgame
+    if (!occupied) { playSound("confirm"); beginInSlot(idx, true); }
+    else { playSound("confirm"); slotConfirm = { idx: idx, sel: 1 }; draw(); }
+  }
+}
+function handleTitleKey(k, isConfirm) {
+  const isCancel = (k === "Backspace" || k === "x" || k === "X" || k === "Escape");
+  if (titleScreen === "slots" && slotConfirm) {
+    if (k === "ArrowLeft" || k === "a" || k === "A" || k === "ArrowRight" || k === "d" || k === "D" ||
+        k === "ArrowUp" || k === "w" || k === "W" || k === "ArrowDown" || k === "s" || k === "S") {
+      slotConfirm.sel = slotConfirm.sel === 0 ? 1 : 0;
+      playSound("cursor");
+      draw();
+    } else if (isConfirm) {
+      playSound("confirm");
+      const idx = slotConfirm.idx, yes = slotConfirm.sel === 0;
+      slotConfirm = null;
+      if (yes) beginInSlot(idx, true); else draw();
+    } else if (isCancel) {
+      playSound("cancel");
+      slotConfirm = null;
+      draw();
+    }
+    return;
+  }
+  if (titleScreen === "root") {
+    const items = titleItems();
+    if (k === "ArrowUp" || k === "w" || k === "W") { const b = titleCursor; titleCursor = (titleCursor + items.length - 1) % items.length; if (titleCursor !== b) playSound("cursor"); draw(); }
+    else if (k === "ArrowDown" || k === "s" || k === "S") { const b = titleCursor; titleCursor = (titleCursor + 1) % items.length; if (titleCursor !== b) playSound("cursor"); draw(); }
+    else if (isConfirm) titleRootActivate();
+    return;
+  }
+  // slots
+  if (k === "ArrowUp" || k === "w" || k === "W") { slotMove(-1); draw(); }
+  else if (k === "ArrowDown" || k === "s" || k === "S") { slotMove(1); draw(); }
+  else if (isConfirm) titleSlotSelect();
+  else if (isCancel) { playSound("cancel"); titleScreen = "root"; slotCtx = null; draw(); }
+}
+const TITLE_ITEM_Y = 118, TITLE_ITEM_H = 30;
+const CONFIRM_YES = { x:118, y:140, w:72, h:26 }, CONFIRM_NO = { x:210, y:140, w:72, h:26 };
+function titleClick(p) {
+  if (titleScreen === "slots" && slotConfirm) {
+    if (inRect(p, CONFIRM_YES.x, CONFIRM_YES.y, CONFIRM_YES.w, CONFIRM_YES.h)) {
+      if (slotConfirm.sel === 0) { playSound("confirm"); const idx = slotConfirm.idx; slotConfirm = null; beginInSlot(idx, true); }
+      else { slotConfirm.sel = 0; playSound("cursor"); draw(); }
+    } else if (inRect(p, CONFIRM_NO.x, CONFIRM_NO.y, CONFIRM_NO.w, CONFIRM_NO.h)) {
+      if (slotConfirm.sel === 1) { playSound("cancel"); slotConfirm = null; draw(); }
+      else { slotConfirm.sel = 1; playSound("cursor"); draw(); }
+    }
+    return;
+  }
+  if (titleScreen === "root") {
+    const items = titleItems();
+    for (let i = 0; i < items.length; i++) {
+      if (inRect(p, 96, TITLE_ITEM_Y + i * TITLE_ITEM_H, 208, 28)) {
+        if (titleCursor === i) titleRootActivate();
+        else { titleCursor = i; playSound("cursor"); draw(); }
+        return;
+      }
+    }
+    return;
+  }
+  // slots
+  if (!slotCtx) return;
+  for (let r = 0; r < SLOT_ROWS; r++) {
+    const idx = slotCtx.top + r;
+    if (idx >= SLOT_COUNT) break;
+    if (inRect(p, 28, slotGeom.y0 + r * SLOT_ROW_H, 344, SLOT_ROW_H)) {
+      if (slotCtx.cursor === idx) titleSlotSelect();
+      else { slotCtx.cursor = idx; playSound("cursor"); adjustSlotScroll(); draw(); }
+      return;
+    }
+  }
+}
+function drawTitle() {
+  ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
+  text("maou-rpg", 200, 34, 30, "#f0ead6", "center");
+  text("v0.7", 200, 72, 10, "#888", "center");
+  if (titleScreen === "root") {
+    const items = titleItems();
+    items.forEach((it, i) => {
+      const y = TITLE_ITEM_Y + i * TITLE_ITEM_H;
+      if (i === titleCursor) text("▶", 108, y + 4, 13, "#f6c65b");
+      text(it.label, 128, y + 4, 13, i === titleCursor ? "#fff" : "#cfc9b8");
+    });
+    return;
+  }
+  text(slotCtx && slotCtx.purpose === "continue" ? "つづき：スロットを えらんでください" : "はじめから：スロットを えらんでください", 200, 62, 11, "#cfc9b8", "center");
+  drawSlotList(84);
+  if (slotConfirm) {
+    box(56, 92, 288, 82);
+    text("スロット" + (slotConfirm.idx + 1) + " のデータを消して", 200, 102, 11, "#f0ead6", "center");
+    text("はじめからにしますか？", 200, 118, 11, "#f0ead6", "center");
+    text((slotConfirm.sel === 0 ? "▶" : "　") + "はい", CONFIRM_YES.x + 8, CONFIRM_YES.y + 6, 12, slotConfirm.sel === 0 ? "#f6c65b" : "#f0ead6");
+    text((slotConfirm.sel === 1 ? "▶" : "　") + "いいえ", CONFIRM_NO.x + 8, CONFIRM_NO.y + 6, 12, slotConfirm.sel === 1 ? "#f6c65b" : "#f0ead6");
+  }
+}
+
+/* ============ Boot ============ */
+(async () => {
+  await loadSaves();
+  await loadPlayLog();
+  currentSlot = Math.max(0, Math.min(SLOT_COUNT - 1, savesData.lastSlot || 0));
+  mode = "title";
+  titleScreen = "root";
+  titleCursor = 0;
+  draw();
 })();
 </script>
 </body>
