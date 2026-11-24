@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>maou-rpg v0.2</title>
+<title>maou-rpg v0.3</title>
 <style>
   html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden; }
   body { display:flex; align-items:center; justify-content:center; }
@@ -31,7 +31,11 @@ const MONSTERS = {
 const LEVELS = {1:{maxhp:28, atk:7}, 2:{maxhp:34, atk:9}, 3:{maxhp:40, atk:11}};
 const EXP_NEXT = {1:8, 2:22}; // Lv2 at EXP>=8, Lv3 at EXP>=22
 
-/* ============ Maps (string grids) — unchanged from v0.1 ============ */
+/* ============ Maps (string grids) ============
+   v0.3 changes: cave chest moved to a side-path dead end near the normal exit
+   (the north-east strip along row 1; leaving the main route at the shaft
+   (8,3) it is 9 steps in and 9 steps back = an 18-step round-trip detour),
+   old cart at the NW dead end (2,2), castle gate-side note at (5,11). */
 const MAPS = {
   village: {
     name:"はじまりの村", w:12, h:10,
@@ -48,9 +52,9 @@ const MAPS = {
       "#####E######"
     ],
     npcs:[
-      {x:3, y:4, color:"#c9a227", lines:["老人：「あの城には、裏から入れる道があると聞く。」"]},
-      {x:8, y:4, color:"#27ae60", lines:["商人：「洞窟の西の方じゃ、風が妙に冷たいんだ。」"]},
-      {x:5, y:6, color:"#e67e22", lines:["子ども：「岩を押したら、ちょっと動いたんだ！」"]}
+      {x:3, y:4, color:"#c9a227", lines:["老人：「昔は、城へ荷物を運ぶ地下道があったそうじゃ。」"]},
+      {x:8, y:4, color:"#27ae60", lines:["商人：「洞窟の西の壁から、風が吹いてくるんだ。」"]},
+      {x:5, y:6, color:"#e67e22", lines:["子ども：「洞窟で岩によりかかったら、ぐらっとしたよ。」"]}
     ],
     enemies:[]
   },
@@ -98,8 +102,8 @@ const MAPS = {
     name:"ほらあな", w:18, h:12,
     grid:[
       "##################",
-      "#....#.......#...#",
-      "#.*..#.......#.E.#",
+      "#....#..........*#",
+      "#.O..#......###E##",
       "#....#...........#",
       "#....#.....#.....#",
       "#..........#.....#",
@@ -131,7 +135,7 @@ const MAPS = {
       "#.#...#..#...#",
       "#.#.###.######",
       "#.#.....#....#",
-      "#......G.....#"
+      "#....N.G.....#"
     ],
     npcs:[],
     enemies:[
@@ -152,16 +156,78 @@ function setTile(map, x, y, ch) {
   const row = grids[map][y];
   grids[map][y] = row.substring(0, x) + ch + row.substring(x + 1);
 }
-const SOLID = "#TCIS*?";
+const SOLID = "#TCIS*?ON";
 function isSolid(map, x, y) { return SOLID.indexOf(tileAt(map, x, y)) >= 0; }
 
-/* ============ State — same fields as v0.1 (save compatible) ============ */
+/* ============ Sections (cave & castle vision) ============
+   Every tile gets a section id. Only the player's current section is
+   visible (plus a 1-tile fringe of neighbouring sections: entrances and
+   boundary walls), with wall occlusion inside it. */
+function paintRect(arr, x0, y0, x1, y1, ch) {
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) arr[y][x] = ch;
+}
+function buildSections(map, base) {
+  const a = [];
+  for (let y = 0; y < MAPS[map].h; y++) a.push(new Array(MAPS[map].w).fill(base));
+  return a;
+}
+const SECTIONS = {};
+{
+  const c = buildSections("cave", "D");       // D = east / north rooms
+  paintRect(c, 0, 9, 17, 11, "A");            // A = entrance hall (south)
+  paintRect(c, 0, 0, 4, 8, "C");              // C = west (secret side)
+  paintRect(c, 5, 5, 7, 6, "C");              // C = west corridor rows 5-6
+  paintRect(c, 8, 3, 9, 8, "B");              // B = central shaft
+  paintRect(c, 13, 0, 17, 1, "E");            // E = chest side path (north-east)
+  paintRect(c, 15, 2, 15, 2, "E");            //    (normal-exit tile belongs to E)
+  SECTIONS.cave = c;
+  const s = buildSections("castle", "M");     // M = middle rooms
+  paintRect(s, 0, 0, 13, 3, "K");             // K = boss room
+  paintRect(s, 0, 4, 3, 11, "W");             // W = west column
+  paintRect(s, 11, 4, 13, 11, "E");           // E = east pocket
+  paintRect(s, 0, 11, 13, 11, "G");           // G = gate / bottom corridor
+  SECTIONS.castle = s;
+}
+
+/* ============ State ============ */
+/*TEST:migrate:start*/
 function freshState() {
   return { map:"village", x:6, y:8, dir:"down", lv:1, hp:LEVELS[1].maxhp, exp:0, gold:10,
-           herbs:1, secretOpen:false, cleared:false, chestOpened:false };
+           herbs:1, water:0, hasSleepPowder:false,
+           secretOpen:false, cleared:false,
+           chestOpened:false, chestStage:0,
+           stats:{ wins:0, steps:0, deaths:0, elapsedMs:0 },
+           clearRecord:null };
 }
+/* Migrate any older save (v0.1/v0.2 fields) to v0.3: missing fields get
+   defaults. A legacy save whose chest was already opened counts as
+   chest stage 1, so the sleep powder (stage 2) is still obtainable. */
+function migrateSave(loaded) {
+  const s = Object.assign(freshState(), loaded || {});
+  if (!loaded || typeof loaded.chestStage !== "number") {
+    s.chestStage = (loaded && loaded.chestOpened) ? 1 : 0;
+  }
+  s.chestOpened = s.chestStage >= 1;
+  if (typeof s.hasSleepPowder !== "boolean") s.hasSleepPowder = false;
+  if (typeof s.water !== "number") s.water = 0;
+  s.stats = Object.assign({ wins:0, steps:0, deaths:0, elapsedMs:0 }, (loaded && loaded.stats) || {});
+  if (!("clearRecord" in s) || s.clearRecord === undefined) s.clearRecord = null;
+  return s;
+}
+/*TEST:migrate:end*/
 let S = freshState();
 let activeEnemies = [];
+
+/* Play-time accumulation: stats.elapsedMs is the saved base; while the
+   page is open, elapsed = base + (now - playStart). Saving rebases. */
+let playStart = Date.now();
+function currentElapsed() { return (S.stats ? S.stats.elapsedMs : 0) + (Date.now() - playStart); }
+function fmtTime(ms) {
+  const sec = Math.floor(ms / 1000);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), ss = sec % 60;
+  const p = n => (n < 10 ? "0" : "") + n;
+  return h > 0 ? h + ":" + p(m) + ":" + p(ss) : p(m) + ":" + p(ss);
+}
 
 function heroMaxHp() { return LEVELS[S.lv].maxhp; }
 function heroAtk() { return LEVELS[S.lv].atk; }
@@ -175,7 +241,7 @@ function enemyAt(x, y) {
   return activeEnemies.find(e => !e.inactive && e.x === x && e.y === y);
 }
 
-/* ============ IndexedDB save — same db/store/key as v0.1 ============ */
+/* ============ IndexedDB save — same db/store/key as v0.1/v0.2 ============ */
 let dbPromise = null;
 function openDB() {
   if (!dbPromise) {
@@ -189,13 +255,17 @@ function openDB() {
   return dbPromise;
 }
 async function saveGame() {
+  const snap = JSON.parse(JSON.stringify(S));
+  snap.stats.elapsedMs = currentElapsed();
   const db = await openDB();
   await new Promise((res, rej) => {
     const tx = db.transaction("save", "readwrite");
-    tx.objectStore("save").put(JSON.parse(JSON.stringify(S)), "main");
+    tx.objectStore("save").put(snap, "main");
     tx.oncomplete = () => res();
     tx.onerror = () => rej(tx.error);
   });
+  S.stats.elapsedMs = snap.stats.elapsedMs;
+  playStart = Date.now();
 }
 function saveQuiet() { saveGame().catch(() => {}); }
 async function loadGame() {
@@ -215,9 +285,9 @@ async function deleteSave() {
   } catch (e) {}
 }
 
-/* ============ Vision (radius + LOS) ============ */
-const VISION_RADIUS = { village:5, cave:4, castle:4 }; // field: unlimited
-const SIGHT_BLOCKERS = "#?CIST";
+/* ============ Vision ============ */
+const VISION_RADIUS = { village:5 }; // field: unlimited; cave/castle: sections
+const SIGHT_BLOCKERS = "#?CISTON";
 function blocksSight(map, x, y) { return SIGHT_BLOCKERS.indexOf(tileAt(map, x, y)) >= 0; }
 /* Grid raycast (Amanatides & Woo). The target tile itself is not tested,
    so a wall is visible while tiles behind it are not. When the ray passes
@@ -247,18 +317,36 @@ function losClear(map, x0, y0, x1, y1) {
 }
 function isVisible(x, y) {
   if (x === S.x && y === S.y) return true;
-  const r = VISION_RADIUS[S.map];
-  if (r === undefined) return true; // field: no limit inside the viewport
-  if (Math.abs(x - S.x) > r || Math.abs(y - S.y) > r) return false;
+  if (S.map === "field") return true; // no limit inside the viewport
+  if (S.map === "village") {
+    const r = VISION_RADIUS.village;
+    if (Math.abs(x - S.x) > r || Math.abs(y - S.y) > r) return false;
+    return losClear(S.map, S.x, S.y, x, y);
+  }
+  // cave / castle: section-based vision + LOS
+  const sec = SECTIONS[S.map];
+  if (!sec || !sec[y]) return true;
+  const ps = sec[S.y][S.x], ts = sec[y][x];
+  if (ts !== ps) {
+    // Fringe: a tile of another section that touches the player's section
+    // (an entrance tile or a boundary wall) can be seen; nothing deeper.
+    let fringe = false;
+    const nb = [[1,0],[-1,0],[0,1],[0,-1]];
+    for (const d of nb) {
+      const nx = x + d[0], ny = y + d[1];
+      if (sec[ny] && sec[ny][nx] === ps) { fringe = true; break; }
+    }
+    if (!fringe) return false;
+  }
   return losClear(S.map, S.x, S.y, x, y);
 }
 
 /* ============ Canvas setup: fixed 400x240 logical resolution ============ */
 const cv = document.getElementById("game"), ctx = cv.getContext("2d");
 ctx.imageSmoothingEnabled = false;
-const W = 400, H = 240, TILE = 16;
-const PLAYER_SX = 192, PLAYER_SY = 112; // tile 13th col / 8th row
+const W = 400, H = 240;
 const HIDDEN_COLOR = "#05080D";
+const INDOOR = { village:true, cave:true, castle:true }; // 32px tiles indoors
 
 function fitCanvas() {
   const scale = Math.min(window.innerWidth / W, window.innerHeight / H);
@@ -276,9 +364,9 @@ function inRect(p, x, y, w, h) { return p.x >= x && p.x < x + w && p.y >= y && p
 
 /* ============ Modes & UI state ============ */
 let mode = "map"; // "map" | "menu" | "battle"
-let lastPointer = false; // touch/pointer controls visibility heuristic
-let dialogPages = null;  // array of [line, line] pages, or null
-let dialogChoices = null; // {title, options:[{label,fn}], sel}
+let lastPointer = false; // on-screen controls shown only after actual pointer use
+let dialogPages = null;
+let dialogChoices = null;
 let pendingChoices = null;
 
 /* ---------- dialog (map mode, bottom box only while active) ---------- */
@@ -302,7 +390,7 @@ function showDialog(lines, choices) {
 }
 function dialogActive() { return dialogPages !== null || dialogChoices !== null; }
 function advanceDialog() {
-  if (dialogChoices) return; // choices need a selection, not advance
+  if (dialogChoices) return;
   if (!dialogPages) return;
   dialogPages.shift();
   if (dialogPages.length === 0) {
@@ -326,13 +414,20 @@ function chooseDialogOption(i) {
 let menuScreen = "root"; // root | items | status | save | settings
 const menuCursors = { root:0, items:0, save:0, settings:0 };
 let soundOn = true;
-let saveResult = "";     // shown on save screen after a successful save
-let itemsNote = "";      // transient note replacing the item description
+let saveResult = "";
+let itemsNote = "";
 let newGameArmed = false;
 
-const INVENTORY = [
-  { id:"herb", name:"やくそう", desc:"HPを16回復", count:() => S.herbs }
-];
+function inventoryList() {
+  const list = [
+    { id:"herb",   label:"やくそう ×" + S.herbs, desc:"HPを16回復" },
+    { id:"water",  label:"水びん ×" + S.water,   desc:"水の入ったびん。魔物に投げつけることができる。" }
+  ];
+  if (S.hasSleepPowder) {
+    list.push({ id:"powder", label:"ねむり粉", desc:"魔物に振りかける粉。1回の戦闘で一度だけ使える。" });
+  }
+  return list;
+}
 function rootItems() {
   return [
     { id:"items",    label:"どうぐ" },
@@ -350,7 +445,7 @@ function settingsItems() {
 }
 function currentList() {
   if (menuScreen === "root") return rootItems();
-  if (menuScreen === "items") return INVENTORY.map(it => ({ id:it.id, label: it.name + "  ×" + it.count(), desc: it.desc }));
+  if (menuScreen === "items") return inventoryList();
   if (menuScreen === "save") return [{ id:"save", label:"セーブする" }];
   if (menuScreen === "settings") return settingsItems();
   return []; // status: no selection
@@ -368,6 +463,8 @@ async function resetGame() {
   await deleteSave();
   S = freshState();
   grids.cave = MAPS.cave.grid.slice();
+  grids.castle = MAPS.castle.grid.slice();
+  playStart = Date.now();
   spawnEnemies();
   mode = "map"; menuScreen = "root"; newGameArmed = false;
   saveQuiet();
@@ -393,6 +490,12 @@ function menuConfirm() {
         itemsNote = "HPが " + healed + " 回復した";
         saveQuiet();
       }
+      draw();
+    } else if (item.id === "water") {
+      itemsNote = "魔物に投げつけるものだ。戦闘中に使おう。";
+      draw();
+    } else if (item.id === "powder") {
+      itemsNote = "戦闘中に使うものだ。";
       draw();
     }
   } else if (menuScreen === "save") {
@@ -438,11 +541,19 @@ function drawSprite(c, grid, cx, cy, size) {
     if (col) { c.fillStyle = col; c.fillRect(cx + x * px, cy + y * px, px, px); }
   }
 }
-function drawPerson(c, px, py, color) { // fits one 16px tile
-  c.fillStyle = "#17202A"; c.fillRect(px + 5, py + 1, 6, 3);   // hair
-  c.fillStyle = "#f2c894"; c.fillRect(px + 5, py + 3, 6, 5);   // head
-  c.fillStyle = color;     c.fillRect(px + 4, py + 8, 8, 5);   // body
-  c.fillStyle = "#17202A"; c.fillRect(px + 5, py + 13, 2, 3); c.fillRect(px + 9, py + 13, 2, 3); // legs
+function drawSpriteH(c, grid, cx, cy, w, h) { // sprite with independent w/h (flattened puni)
+  const px = w / 16, py = h / 16;
+  for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) {
+    const col = PALETTE[grid[y].charAt(x)];
+    if (col) { c.fillStyle = col; c.fillRect(cx + x * px, cy + y * py, px, py); }
+  }
+}
+function drawPerson(c, px, py, color, size) {
+  const u = (size || 16) / 16;
+  c.fillStyle = "#17202A"; c.fillRect(px + 5*u, py + 1*u, 6*u, 3*u);   // hair
+  c.fillStyle = "#f2c894"; c.fillRect(px + 5*u, py + 3*u, 6*u, 5*u);   // head
+  c.fillStyle = color;     c.fillRect(px + 4*u, py + 8*u, 8*u, 5*u);   // body
+  c.fillStyle = "#17202A"; c.fillRect(px + 5*u, py + 13*u, 2*u, 3*u); c.fillRect(px + 9*u, py + 13*u, 2*u, 3*u); // legs
 }
 function box(x, y, w, h, fill) {
   ctx.fillStyle = fill || "#101018";
@@ -474,52 +585,77 @@ const DPAD = {
 };
 const ABTN = { x:348, y:172, r:20 };
 
+function drawTile(t, dx, dy, ts, pal, mx, my) {
+  const u = ts / 16;
+  ctx.fillStyle = ((mx + my) % 2 === 0) ? pal.floor : pal.alt;
+  ctx.fillRect(dx, dy, ts, ts);
+  if (t === "#" || t === "?") { // secret wall looks exactly like a normal wall
+    ctx.fillStyle = pal.wall; ctx.fillRect(dx, dy, ts, ts);
+    ctx.fillStyle = "rgba(255,255,255,0.08)"; ctx.fillRect(dx, dy, ts, 3 * u);
+  } else if (t === "T") {
+    ctx.fillStyle = "#6b4a2b"; ctx.fillRect(dx + 7*u, dy + 9*u, 3*u, 6*u);
+    ctx.fillStyle = "#1e6b2e"; ctx.beginPath(); ctx.arc(dx + 8*u, dy + 7*u, 6*u, 0, 7); ctx.fill();
+  } else if (t === "C" || t === "I" || t === "S") {
+    ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 1*u, dy + 5*u, 14*u, 11*u);
+    ctx.fillStyle = t === "C" ? "#e8e4da" : (t === "I" ? "#c0392b" : "#2471a3");
+    ctx.beginPath(); ctx.moveTo(dx, dy + 6*u); ctx.lineTo(dx + 8*u, dy); ctx.lineTo(dx + 16*u, dy + 6*u); ctx.fill();
+    text(t === "C" ? "✚" : (t === "I" ? "宿" : "店"), dx + 8*u, dy + 6*u, 8 * u, "#fff", "center");
+  } else if (t === "*") {
+    if (S.chestStage === 0) { // closed chest
+      ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 3*u, dy + 6*u, 11*u, 8*u);
+      ctx.fillStyle = "#f6c65b"; ctx.fillRect(dx + 3*u, dy + 6*u, 11*u, 3*u); ctx.fillRect(dx + 7*u, dy + 6*u, 3*u, 8*u);
+    } else { // opened chest (plain, no glow / marker)
+      ctx.fillStyle = "#5d3d22"; ctx.fillRect(dx + 3*u, dy + 8*u, 11*u, 6*u);
+      ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 3*u, dy + 4*u, 11*u, 3*u);
+      ctx.fillStyle = "#2b1a0e"; ctx.fillRect(dx + 4*u, dy + 9*u, 9*u, 4*u);
+    }
+  } else if (t === "O") { // old cart
+    ctx.fillStyle = "#6e4525"; ctx.fillRect(dx + 1*u, dy + 5*u, 14*u, 6*u);
+    ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 1*u, dy + 5*u, 14*u, 2*u);
+    ctx.fillStyle = "#17202A";
+    ctx.beginPath(); ctx.arc(dx + 4*u, dy + 13*u, 2.4*u, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(dx + 12*u, dy + 13*u, 2.4*u, 0, 7); ctx.fill();
+    ctx.fillStyle = "#f7f5e8"; ctx.fillRect(dx + 6*u, dy + 6*u, 4*u, 3*u); // memo paper
+  } else if (t === "N") { // note on the castle wall
+    ctx.fillStyle = pal.wall; ctx.fillRect(dx, dy, ts, ts);
+    ctx.fillStyle = "#f7f5e8"; ctx.fillRect(dx + 4*u, dy + 3*u, 8*u, 10*u);
+    ctx.fillStyle = "#8a8a8a";
+    ctx.fillRect(dx + 5.5*u, dy + 5.5*u, 5*u, 1*u);
+    ctx.fillRect(dx + 5.5*u, dy + 8*u, 5*u, 1*u);
+    ctx.fillRect(dx + 5.5*u, dy + 10.5*u, 3.5*u, 1*u);
+  } else if (t === "P") {
+    ctx.fillStyle = "#0a0a12"; ctx.fillRect(dx, dy, ts, ts);
+    ctx.fillStyle = "#8750c7"; ctx.fillRect(dx + 2*u, dy + 2*u, 2*u, 2*u); ctx.fillRect(dx + 12*u, dy + 12*u, 2*u, 2*u);
+  } else if (t === "D" || t === "X" || t === "E" || t === "V" || t === "G") {
+    ctx.fillStyle = "#14141c"; ctx.fillRect(dx + 2*u, dy + 2*u, 12*u, 12*u);
+    text(t === "G" ? "門" : "↓", dx + 8*u, dy + 4*u, 8 * u, "#f6c65b", "center");
+  }
+}
+
 function drawMap() {
   const pal = TILE_COLORS[S.map];
+  const indoor = !!INDOOR[S.map];
+  const ts = indoor ? 32 : 16;                    // tile display size
+  const pox = indoor ? 184 : 192, poy = indoor ? 104 : 112; // player tile top-left (hero centered)
+  const rx = indoor ? 6 : 12, ryu = indoor ? 4 : 7, ryd = indoor ? 3 : 7;
   ctx.fillStyle = HIDDEN_COLOR; ctx.fillRect(0, 0, W, H);
-  for (let sy = 0; sy < 15; sy++) for (let sx = 0; sx < 25; sx++) {
-    const mx = S.x + sx - 12, my = S.y + sy - 7;
-    const dx = sx * TILE, dy = sy * TILE;
+  for (let my = S.y - ryu; my <= S.y + ryd; my++) for (let mx = S.x - rx; mx <= S.x + rx; mx++) {
+    const dx = pox + (mx - S.x) * ts, dy = poy + (my - S.y) * ts;
     if (mx < 0 || my < 0 || mx >= MAPS[S.map].w || my >= MAPS[S.map].h) continue; // out of map: dark
     if (!isVisible(mx, my)) continue; // hidden: dark
-    const t = tileAt(S.map, mx, my);
-    ctx.fillStyle = ((mx + my) % 2 === 0) ? pal.floor : pal.alt;
-    ctx.fillRect(dx, dy, TILE, TILE);
-    if (t === "#" || t === "?") { // secret wall looks exactly like a normal wall
-      ctx.fillStyle = pal.wall; ctx.fillRect(dx, dy, TILE, TILE);
-      ctx.fillStyle = "rgba(255,255,255,0.08)"; ctx.fillRect(dx, dy, TILE, 3);
-    } else if (t === "T") {
-      ctx.fillStyle = "#6b4a2b"; ctx.fillRect(dx + 7, dy + 9, 3, 6);
-      ctx.fillStyle = "#1e6b2e"; ctx.beginPath(); ctx.arc(dx + 8, dy + 7, 6, 0, 7); ctx.fill();
-    } else if (t === "C" || t === "I" || t === "S") {
-      ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 1, dy + 5, 14, 11);
-      ctx.fillStyle = t === "C" ? "#e8e4da" : (t === "I" ? "#c0392b" : "#2471a3");
-      ctx.beginPath(); ctx.moveTo(dx, dy + 6); ctx.lineTo(dx + 8, dy); ctx.lineTo(dx + 16, dy + 6); ctx.fill();
-      text(t === "C" ? "✚" : (t === "I" ? "宿" : "店"), dx + 8, dy + 6, 8, "#fff", "center");
-    } else if (t === "*") {
-      if (!S.chestOpened) {
-        ctx.fillStyle = "#8a5a33"; ctx.fillRect(dx + 3, dy + 6, 11, 8);
-        ctx.fillStyle = "#f6c65b"; ctx.fillRect(dx + 3, dy + 6, 11, 3); ctx.fillRect(dx + 7, dy + 6, 3, 8);
-      }
-    } else if (t === "P") {
-      ctx.fillStyle = "#0a0a12"; ctx.fillRect(dx, dy, TILE, TILE);
-      ctx.fillStyle = "#8750c7"; ctx.fillRect(dx + 2, dy + 2, 2, 2); ctx.fillRect(dx + 12, dy + 12, 2, 2);
-    } else if (t === "D" || t === "X" || t === "E" || t === "V" || t === "G") {
-      ctx.fillStyle = "#14141c"; ctx.fillRect(dx + 2, dy + 2, 12, 12);
-      text(t === "G" ? "門" : "↓", dx + 8, dy + 4, 8, "#f6c65b", "center");
-    }
+    drawTile(tileAt(S.map, mx, my), dx, dy, ts, pal, mx, my);
   }
   // NPCs / enemies: only when visible
-  MAPS[S.map].npcs.forEach(n => { if (isVisible(n.x, n.y)) drawPerson(ctx, PLAYER_SX + (n.x - S.x) * TILE, PLAYER_SY + (n.y - S.y) * TILE, n.color); });
-  activeEnemies.forEach(e => { if (!e.inactive && isVisible(e.x, e.y)) drawSprite(ctx, SPRITES[e.type], PLAYER_SX + (e.x - S.x) * TILE, PLAYER_SY + (e.y - S.y) * TILE, TILE); });
+  MAPS[S.map].npcs.forEach(n => { if (isVisible(n.x, n.y)) drawPerson(ctx, pox + (n.x - S.x) * ts, poy + (n.y - S.y) * ts, n.color, ts); });
+  activeEnemies.forEach(e => { if (!e.inactive && isVisible(e.x, e.y)) drawSprite(ctx, SPRITES[e.type], pox + (e.x - S.x) * ts, poy + (e.y - S.y) * ts, ts); });
   // Player: always at screen center
-  drawPerson(ctx, PLAYER_SX, PLAYER_SY, "#2456c7");
-  ctx.fillStyle = "#f6c65b"; ctx.fillRect(PLAYER_SX + 5, PLAYER_SY, 6, 2); // circlet
+  drawPerson(ctx, pox, poy, "#2456c7", ts);
+  ctx.fillStyle = "#f6c65b"; ctx.fillRect(pox + 5 * (ts/16), poy, 6 * (ts/16), 2 * (ts/16)); // circlet
   // Menu button (always visible on the map screen)
   ctx.fillStyle = "rgba(16,16,24,0.85)"; ctx.fillRect(MENU_BTN.x, MENU_BTN.y, MENU_BTN.w, MENU_BTN.h);
   ctx.strokeStyle = "#f0ead6"; ctx.lineWidth = 1; ctx.strokeRect(MENU_BTN.x + 0.5, MENU_BTN.y + 0.5, MENU_BTN.w - 1, MENU_BTN.h - 1);
   text("メニュー", MENU_BTN.x + MENU_BTN.w / 2, MENU_BTN.y + 4, 11, "#f0ead6", "center");
-  // Touch controls (shown after pointer input)
+  // Touch controls (shown only after actual pointer input)
   if (lastPointer && !dialogActive()) {
     ctx.globalAlpha = 0.75;
     for (const k in DPAD) {
@@ -556,7 +692,7 @@ const SCREEN_TITLES = { root:"メニュー", items:"どうぐ", status:"つよ�
 function drawMenu() {
   ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
   text(SCREEN_TITLES[menuScreen], 16, 12, 15);
-  text("v0.2", 384, 14, 9, "#888", "right");
+  text("v0.3", 384, 14, 9, "#888", "right");
   const list = currentList();
   const cur = menuCursors[menuScreen] || 0;
   list.forEach((item, i) => {
@@ -582,38 +718,72 @@ function drawMenu() {
   if (menuScreen === "items" || menuScreen === "settings") {
     box(112, 190, 272, 42);
     const item = list[cur];
-    const desc = menuScreen === "items" && itemsNote ? itemsNote : (item ? (item.desc || "") : "");
-    text(desc, 122, 204, 12);
+    if (menuScreen === "items" && itemsNote) {
+      text(itemsNote, 122, 204, 12);
+    } else if (item) {
+      const dl = wrapDesc(item.desc || "");
+      dl.forEach((ln, i) => text(ln, 122, 196 + i * 15, 11));
+      // Recovery item selected: show current HP and HP after use (only then)
+      if (menuScreen === "items" && item.id === "herb") {
+        const after = Math.min(heroMaxHp(), S.hp + 16);
+        text("HP " + S.hp + " / " + heroMaxHp() + " → " + after, 122, 196 + dl.length * 15, 11, "#9fe870");
+      }
+    }
   }
   // Back button: fixed bottom-left on every menu screen
   ctx.fillStyle = "#2b2b44"; ctx.fillRect(16, 206, 80, 26);
   ctx.strokeStyle = "#f0ead6"; ctx.lineWidth = 1; ctx.strokeRect(16.5, 206.5, 79, 25);
   text("もどる", 56, 212, 12, "#f0ead6", "center");
 }
+function wrapDesc(s) {
+  const MAX = 21, out = [];
+  let t = s;
+  while (t.length > MAX && out.length < 2) { out.push(t.substring(0, MAX)); t = t.substring(MAX); }
+  out.push(t);
+  return out.slice(0, 2);
+}
 
 /* ============ Battle rendering ============ */
 let battleMsg = "";
 const BCMDS = [
-  { id:"fight", label:"たたかう", x:12 },
-  { id:"herb",  label:"やくそう", x:140 },
-  { id:"run",   label:"にげる",  x:268 }
+  { id:"fight", label:"たたかう" },
+  { id:"defend", label:"ぼうぎょ" },
+  { id:"items", label:"どうぐ" },
+  { id:"run", label:"にげる" }
 ];
 let battleCursor = 0;
+function cmdRect(i) { return { x: 8 + i * 97, y: 204, w: 89, h: 28 }; }
 function drawBattle() {
   ctx.fillStyle = "#180f18"; ctx.fillRect(0, 0, W, H);
   if (foe) {
-    drawSprite(ctx, SPRITES[foe.type], 156, 10, 88);
+    if (foe.type === "puni" && foeFlat) drawSpriteH(ctx, SPRITES.puni, 156, 54, 88, 44);
+    else drawSprite(ctx, SPRITES[foe.type], 156, 10, 88);
     text(MONSTERS[foe.type].name, 200, 104, 14, "#f0ead6", "center");
+    // Persistent state indicators (top-left), so the wind-up stays visible while choosing a command
+    if (foeState.sleep > 0) text("眠っている…", 12, 10, 11, "#8ec9e8");
+    else if (foe.type === "king" && foeState.phase === 3) text("こん棒を振り上げている！", 12, 10, 11, "#e85653");
   }
   text("ゆうしゃ　HP " + Math.max(0, S.hp) + " / " + heroMaxHp(), 200, 126, 13, "#f0ead6", "center");
   box(8, 146, 384, 50);
   battleMsg.split("\n").slice(0, 2).forEach((ln, i) => text(ln, 18, 154 + i * 18, 12));
-  BCMDS.forEach((c, i) => {
-    ctx.fillStyle = i === battleCursor ? "#4a3b2b" : "#2b2b44";
-    ctx.fillRect(c.x, 204, 120, 28);
-    ctx.strokeStyle = "#f0ead6"; ctx.lineWidth = 1; ctx.strokeRect(c.x + 0.5, 204.5, 119, 27);
-    text((i === battleCursor ? "▶" : "") + c.label, c.x + 60, 211, 12, "#f0ead6", "center");
-  });
+  if (battleItemsOpen) {
+    box(8, 140, 384, 92);
+    text("どうぐ", 18, 146, 11, "#cfc9b8");
+    const list = battleItems();
+    list.forEach((it, i) => {
+      const y = 164 + i * 16;
+      if (i === battleItemCursor) text("▶", 18, y, 11, "#f6c65b");
+      text(it.label, 34, y, 11, it.usable ? "#f0ead6" : "#777");
+    });
+  } else {
+    BCMDS.forEach((c, i) => {
+      const r = cmdRect(i);
+      ctx.fillStyle = i === battleCursor ? "#4a3b2b" : "#2b2b44";
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.strokeStyle = "#f0ead6"; ctx.lineWidth = 1; ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1);
+      text((i === battleCursor ? "▶" : "") + c.label, r.x + r.w / 2, r.y + 7, 11, "#f0ead6", "center");
+    });
+  }
 }
 
 function draw() {
@@ -622,7 +792,7 @@ function draw() {
   else drawMap();
 }
 
-/* ============ Map transitions — unchanged from v0.1 ============ */
+/* ============ Map transitions ============ */
 function goTo(map, x, y) {
   S.map = map; S.x = x; S.y = y;
   spawnEnemies();
@@ -640,7 +810,7 @@ function onStepTile(t) {
   else if (S.map === "castle" && t === "G") goTo("field", 33, 7);
 }
 
-/* ============ Movement & interaction — logic unchanged from v0.1 ============ */
+/* ============ Movement & interaction ============ */
 const DIRS = { up:[0,-1], down:[0,1], left:[-1,0], right:[1,0] };
 function tryMove(dir) {
   if (mode !== "map" || dialogActive()) return;
@@ -649,12 +819,28 @@ function tryMove(dir) {
   if (isSolid(S.map, nx, ny)) { draw(); return; }
   if (MAPS[S.map].npcs.some(n => n.x === nx && n.y === ny)) { draw(); return; }
   S.x = nx; S.y = ny;
+  S.stats.steps++;
   const foe = enemyAt(nx, ny);
   if (foe) { startBattle(foe); draw(); return; }
   onStepTile(tileAt(S.map, nx, ny));
   saveQuiet(); draw();
 }
 function facingPos() { const d = DIRS[S.dir]; return {x:S.x + d[0], y:S.y + d[1]}; }
+
+/*TEST:chest:start*/
+function applyChest() {
+  if (S.chestStage === 0) {
+    S.chestStage = 1; S.chestOpened = true; S.herbs += 2;
+    return ["宝箱を開けた！ やくそうを 2個 手に入れた。（現在 " + S.herbs + "個）"];
+  }
+  if (S.chestStage === 1) {
+    S.chestStage = 2; S.hasSleepPowder = true;
+    return ["宝箱の底を もう一度調べると……", "二重底になっていた！ ねむり粉の小袋を 手に入れた。"];
+  }
+  return ["宝箱は空っぽだ。"];
+}
+/*TEST:chest:end*/
+
 function interact() {
   if (mode !== "map") return;
   if (dialogActive()) { advanceDialog(); return; }
@@ -666,30 +852,36 @@ function interact() {
     saveQuiet();
     showDialog(["教会：「よくぞ来た。冒険の記録を神に届けておいたぞ。」", "（セーブしました）"]);
   } else if (t === "I") {
-    showDialog(["宿屋：「一泊 8G だよ。ゆっくり休んでいきな。」"], {
+    showDialog(["宿屋：「無料だよ。ゆっくり休んでいきな。」"], {
       title:"宿屋：どうする？",
       options:[
-        {label:"とまる（8G）", fn:() => {
-          if (S.gold >= 8) { S.gold -= 8; S.hp = heroMaxHp(); saveQuiet(); draw(); showDialog(["ぐっすり眠った。HPが全回復した！"]); }
-          else showDialog(["お金が足りないようだ。"]);
+        {label:"とまる（無料）", fn:() => {
+          S.hp = heroMaxHp(); saveQuiet(); draw(); showDialog(["ぐっすり眠った。HPが全回復した！"]);
         }},
         {label:"やめる", fn:() => showDialog(["宿屋：「また来な。」"])}
       ]});
   } else if (t === "S") {
-    showDialog(["道具屋：「やくそうは 6G だよ。」"], {
+    showDialog(["道具屋：「やくそうは 6G、水びんは 3G だよ。」"], {
       title:"道具屋：どうする？",
       options:[
         {label:"やくそうを買う（6G）", fn:() => {
           if (S.gold >= 6) { S.gold -= 6; S.herbs++; saveQuiet(); draw(); showDialog(["やくそうを 1個 買った。（現在 " + S.herbs + "個）"]); }
           else showDialog(["お金が足りないようだ。"]);
         }},
+        {label:"水びんを買う（3G）", fn:() => {
+          if (S.gold >= 3) { S.gold -= 3; S.water++; saveQuiet(); draw(); showDialog(["水びんを 1個 買った。（現在 " + S.water + "個）"]); }
+          else showDialog(["お金が足りないようだ。"]);
+        }},
         {label:"やめる", fn:() => showDialog(["道具屋：「まいど。」"])}
       ]});
   } else if (t === "*") {
-    if (!S.chestOpened) {
-      S.chestOpened = true; S.herbs++; saveQuiet(); draw();
-      showDialog(["宝箱を開けた！ やくそうを 1個 手に入れた。（現在 " + S.herbs + "個）"]);
-    } else showDialog(["宝箱は空っぽだ。"]);
+    const lines = applyChest();
+    saveQuiet(); draw();
+    showDialog(lines);
+  } else if (t === "O") {
+    showDialog(["古い荷車がある。荷台にメモが残されている。", "「王がこん棒を振り上げたら、盾を構えろ。」"]);
+  } else if (t === "N") {
+    showDialog(["壁に書き置きがある。", "「王が暴れたときのために、見張りには眠り粉を持たせておく。」"]);
   } else if (t === "?" && S.map === "cave") {
     setTile("cave", f.x, f.y, "P");
     S.secretOpen = true; saveQuiet(); draw();
@@ -697,32 +889,199 @@ function interact() {
   }
 }
 
-/* ============ Battle — rules unchanged from v0.1, display trimmed ============ */
+/* ============ Battle ============ */
+/*TEST:king:start*/
+function defendReduce(raw) { return Math.floor(raw * 0.25); }
+/* King action cycle: phase1 normal(6) -> phase2 wind-up(0) -> phase3 strong(16) -> phase1.
+   While asleep the cycle does not advance; when sleep ends after a wind-up
+   was cancelled (reset flag), the cycle restarts at phase 1. */
+function kingAct(st) {
+  if (st.sleep > 0) {
+    st.sleep--;
+    if (st.sleep === 0 && st.reset) { st.phase = 1; st.reset = false; }
+    return { kind:"sleep", dmg:0 };
+  }
+  if (st.phase === 1) { st.phase = 2; return { kind:"attack", dmg:6 }; }
+  if (st.phase === 2) { st.phase = 3; return { kind:"windup", dmg:0 }; }
+  st.phase = 1; return { kind:"strong", dmg:16 };
+}
+/*TEST:king:end*/
+
 let inBattle = false, foe = null, foeHp = 0, battleBusy = false;
+let foeState = { sleep:0, phase:1, reset:false }; // sleep = remaining skipped enemy opportunities
+let foeFlat = false;        // puni flattened: hero's next attack +3
+let defending = false;      // hero is defending this turn
+let powderUsed = false;     // sleep powder: once per battle
+let foeSkip = false;        // toge soaked by water: skips this turn
+let batPreempt = false, batFirstTurn = false;
+let battleItemsOpen = false, battleItemCursor = 0;
+
 function setBattleMsg(t) { battleMsg = t; if (mode === "battle") draw(); }
 function startBattle(enemy) {
   inBattle = true; foe = enemy; battleBusy = false; battleCursor = 0;
   foeHp = MONSTERS[enemy.type].hp;
+  foeState = { sleep:0, phase:1, reset:false };
+  foeFlat = false; defending = false; powderUsed = false; foeSkip = false;
+  batPreempt = (enemy.type === "bat");
+  batFirstTurn = (enemy.type === "bat");
+  battleItemsOpen = false; battleItemCursor = 0;
   mode = "battle";
   const m = MONSTERS[enemy.type];
-  let txt = m.name + " が あらわれた！";
-  if (enemy.type === "bat") {
-    S.hp -= m.atk;
-    txt += "\nバットンの先制攻撃！ " + m.atk + " のダメージ！";
-    setBattleMsg(txt);
-    if (S.hp <= 0) { battleBusy = true; setTimeout(defeat, 900); return; }
-  } else setBattleMsg(txt);
+  setBattleMsg(m.name + " が あらわれた！" + (enemy.type === "bat" ? "\nバットンは すばやい！" : ""));
   draw();
 }
-function enemyAttack() {
+function endTurn() { defending = false; battleBusy = false; draw(); }
+function foeHit(raw, label) {
   const m = MONSTERS[foe.type];
-  S.hp -= m.atk;
-  setBattleMsg(m.name + " の攻撃！\n" + m.atk + " のダメージ！");
+  const dmg = defending ? defendReduce(raw) : raw;
+  S.hp -= dmg;
+  if (foe.type === "puni" && defending) {
+    foeFlat = true;
+    setBattleMsg("ぷにぷにの攻撃！\n盾にぶつかって ぺしゃんこになった！");
+  } else {
+    setBattleMsg((label || (m.name + " の攻撃！")) + "\n" + dmg + " のダメージ！");
+  }
   if (S.hp <= 0) { setTimeout(defeat, 900); return; }
-  battleBusy = false;
+  endTurn();
+}
+function enemyPhase(alreadyActed) {
+  if (!inBattle) return;
+  if (alreadyActed) { endTurn(); return; }
+  const m = MONSTERS[foe.type];
+  if (foe.type === "king") {
+    const act = kingAct(foeState);
+    if (act.kind === "sleep") { setBattleMsg(m.name + "は 眠っている。"); endTurn(); return; }
+    if (act.kind === "windup") { setBattleMsg("魔王は こん棒を 大きく振り上げた！"); endTurn(); return; }
+    foeHit(act.dmg, act.kind === "strong" ? "魔王の強攻撃！" : "魔王の攻撃！");
+    return;
+  }
+  if (foeState.sleep > 0) {
+    foeState.sleep--;
+    batFirstTurn = false;
+    setBattleMsg(m.name + "は 眠っている。");
+    endTurn(); return;
+  }
+  if (foeSkip) {
+    foeSkip = false;
+    setBattleMsg(m.name + "は ぬれて動けない！");
+    endTurn(); return;
+  }
+  let label = m.name + " の攻撃！";
+  if (foe.type === "bat" && batFirstTurn) label = "バットンの先制攻撃！";
+  batFirstTurn = false;
+  foeHit(m.atk, label);
+}
+function heroPhase(action, enemyAlreadyActed) {
+  if (!inBattle) return;
+  const m = MONSTERS[foe.type];
+  if (action.kind !== "fight") foeFlat = false; // a non-attack pick clears the flatten bonus
+  if (action.kind === "fight") {
+    let dmg = heroAtk() + (foeFlat ? 3 : 0);
+    foeFlat = false;
+    let crit = false;
+    if (Math.random() < 0.05) { dmg *= 2; crit = true; }
+    foeHp -= dmg;
+    setBattleMsg((crit ? "かいしんの一撃！" : "勇者の攻撃！") + "\n" + dmg + " のダメージ！");
+    if (foeHp <= 0) { setTimeout(winBattle, 800); return; }
+  } else if (action.kind === "defend") {
+    defending = true;
+    setBattleMsg("勇者は身を守った。");
+  } else if (action.kind === "herb") {
+    S.herbs--;
+    const healed = Math.min(16, heroMaxHp() - S.hp);
+    S.hp += healed;
+    setBattleMsg("やくそうを使った。\nHPが " + healed + " 回復した！");
+  } else if (action.kind === "water") {
+    S.water--;
+    if (foe.type === "toge") {
+      foeHp -= 8; foeSkip = true;
+      setBattleMsg("水びんを投げつけた！\nトゲタケに 8 のダメージ！ 傘がしぼんだ！");
+      if (foeHp <= 0) { setTimeout(winBattle, 800); return; }
+    } else {
+      setBattleMsg("水びんを投げつけた！\nしかし、効果がなかった。");
+    }
+  } else if (action.kind === "powder") {
+    powderUsed = true;
+    if (foe.type === "bat" || foe.type === "king") {
+      foeState.sleep = 2;
+      if (foe.type === "king") foeState.reset = true;
+      setBattleMsg("ねむり粉を振りかけた！\n" + m.name + "は 眠ってしまった！");
+    } else {
+      setBattleMsg("ねむり粉を振りかけた！\nしかし、効果がなかった。");
+    }
+  }
+  setTimeout(() => enemyPhase(enemyAlreadyActed), 800);
+}
+function heroAction(action) {
+  if (!inBattle || battleBusy) return;
+  battleBusy = true;
+  /* Bat preemptive strike: defend and sleep powder resolve BEFORE it;
+     every other first action lets the bat strike first (that strike is
+     the bat's action for the turn). */
+  if (batPreempt && action.kind !== "defend" && action.kind !== "powder") {
+    batPreempt = false; batFirstTurn = false;
+    S.hp -= MONSTERS.bat.atk;
+    setBattleMsg("バットンの先制攻撃！\n" + MONSTERS.bat.atk + " のダメージ！");
+    if (S.hp <= 0) { setTimeout(defeat, 900); return; }
+    setTimeout(() => heroPhase(action, true), 800);
+    return;
+  }
+  batPreempt = false;
+  heroPhase(action, false);
+}
+function escapeBattle() {
+  foe.inactive = true;
+  inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
+  mode = "map";
+  saveQuiet(); draw();
+  showDialog(["勇者は逃げ出した。"]);
+}
+function doRun() {
+  if (!inBattle || battleBusy) return;
+  if (foe.type === "king") { setBattleMsg("魔王からは逃げられない！"); return; }
+  if (batPreempt) {
+    batPreempt = false; batFirstTurn = false; battleBusy = true;
+    S.hp -= MONSTERS.bat.atk;
+    setBattleMsg("バットンの先制攻撃！\n" + MONSTERS.bat.atk + " のダメージ！");
+    if (S.hp <= 0) { setTimeout(defeat, 900); return; }
+    setTimeout(escapeBattle, 800);
+    return;
+  }
+  escapeBattle();
+}
+function battleItems() {
+  const list = [
+    { kind:"herb",  label:"やくそう ×" + S.herbs, usable: S.herbs > 0 },
+    { kind:"water", label:"水びん ×" + S.water,   usable: S.water > 0 }
+  ];
+  if (S.hasSleepPowder) {
+    list.push({ kind:"powder", label:"ねむり粉" + (powderUsed ? "（使用済み）" : ""), usable: !powderUsed });
+  }
+  list.push({ kind:"back", label:"もどる", usable:true });
+  return list;
+}
+function useBattleItem(i) {
+  const it = battleItems()[i];
+  if (!it) return;
+  if (it.kind === "back") { battleItemsOpen = false; draw(); return; }
+  if (!it.usable) {
+    battleItemsOpen = false;
+    setBattleMsg("それは今 使えない。");
+    draw(); return;
+  }
+  battleItemsOpen = false;
+  heroAction({ kind: it.kind });
+}
+function battleCommand(id) {
+  if (!inBattle || battleBusy) return;
+  if (id === "fight") heroAction({ kind:"fight" });
+  else if (id === "defend") heroAction({ kind:"defend" });
+  else if (id === "items") { battleItemsOpen = true; battleItemCursor = 0; draw(); }
+  else if (id === "run") doRun();
 }
 function winBattle() {
   const m = MONSTERS[foe.type];
+  S.stats.wins++;
   S.exp += m.exp; S.gold += m.gold;
   const lines = [m.name + " を倒した！", m.exp + " EXP、" + m.gold + " G を手に入れた。"];
   while (S.lv < 3 && EXP_NEXT[S.lv] && S.exp >= EXP_NEXT[S.lv]) {
@@ -731,51 +1090,33 @@ function winBattle() {
   }
   foe.inactive = true;
   const wasBoss = foe.type === "king";
-  inBattle = false; foe = null; battleBusy = false;
+  inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
   mode = "map";
-  saveQuiet(); draw();
   if (wasBoss) {
-    S.cleared = true; saveQuiet();
-    showDialog(lines.concat(["魔王ゴブリンキングを倒した！", "世界に平和が戻った…… v0.2 クリア！ おめでとう。"]));
+    S.cleared = true;
+    S.clearRecord = { timeMs: currentElapsed(), lv: S.lv, wins: S.stats.wins, steps: S.stats.steps, deaths: S.stats.deaths };
+    saveQuiet(); draw();
+    showDialog(lines.concat([
+      "魔王を倒した！",
+      "クリア時間　" + fmtTime(S.clearRecord.timeMs),
+      "クリアレベル　" + S.clearRecord.lv,
+      "戦闘勝利回数　" + S.clearRecord.wins,
+      "歩数　" + S.clearRecord.steps,
+      "全滅回数　" + S.clearRecord.deaths
+    ]));
   } else {
+    saveQuiet(); draw();
     showDialog(lines);
   }
 }
 function defeat() {
-  inBattle = false; foe = null; battleBusy = false;
+  inBattle = false; foe = null; battleBusy = false; battleItemsOpen = false;
   mode = "map";
+  S.stats.deaths++;
   S.hp = heroMaxHp();
   S.map = "village"; S.x = 2; S.y = 3; S.dir = "down";
   spawnEnemies(); saveQuiet(); draw();
-  showDialog(["勇者は死んでしまった……", "教会で目を覚ました。HPは全回復している。", "（EXPとゴールドは失われていない）"]);
-}
-function battleCommand(id) {
-  if (!inBattle || battleBusy) return;
-  const m = MONSTERS[foe.type];
-  if (id === "fight") {
-    battleBusy = true;
-    let dmg = heroAtk(); let crit = false;
-    if (Math.random() < 0.10) { dmg *= 2; crit = true; }
-    foeHp -= dmg;
-    setBattleMsg((crit ? "かいしんの一撃！" : "勇者の攻撃！") + "\n" + dmg + " のダメージ！");
-    if (foeHp <= 0) { setTimeout(winBattle, 800); return; }
-    setTimeout(enemyAttack, 800);
-  } else if (id === "herb") {
-    if (S.herbs <= 0) { setBattleMsg("やくそうが ない！"); return; }
-    battleBusy = true;
-    S.herbs--;
-    const healed = Math.min(16, heroMaxHp() - S.hp);
-    S.hp += healed;
-    setBattleMsg("やくそうを使った。\nHPが " + healed + " 回復した！");
-    setTimeout(enemyAttack, 800);
-  } else if (id === "run") {
-    if (foe.type === "king") { setBattleMsg("魔王からは逃げられない！"); return; }
-    foe.inactive = true;
-    inBattle = false; foe = null;
-    mode = "map";
-    saveQuiet(); draw();
-    showDialog(["勇者は逃げ出した。"]);
-  }
+  showDialog(["勇者は死んでしまった……", "教会で目を覚ました。HPは全回復している。", "（EXP・ゴールド・アイテムは失われていない）"]);
 }
 
 /* ============ Input: keyboard ============ */
@@ -791,6 +1132,14 @@ document.addEventListener("keydown", e => {
     return;
   }
   if (mode === "battle") {
+    if (battleItemsOpen) {
+      const n = battleItems().length;
+      if (k === "ArrowUp" || k === "w" || k === "W") { battleItemCursor = (battleItemCursor + n - 1) % n; draw(); e.preventDefault(); }
+      else if (k === "ArrowDown" || k === "s" || k === "S") { battleItemCursor = (battleItemCursor + 1) % n; draw(); e.preventDefault(); }
+      else if (isConfirm) { useBattleItem(battleItemCursor); e.preventDefault(); }
+      else if (k === "Backspace" || k === "x" || k === "X" || k === "Escape") { battleItemsOpen = false; draw(); e.preventDefault(); }
+      return;
+    }
     if (k === "ArrowLeft" || k === "a" || k === "A") { battleCursor = (battleCursor + BCMDS.length - 1) % BCMDS.length; draw(); e.preventDefault(); }
     else if (k === "ArrowRight" || k === "d" || k === "D") { battleCursor = (battleCursor + 1) % BCMDS.length; draw(); e.preventDefault(); }
     else if (isConfirm) { battleCommand(BCMDS[battleCursor].id); e.preventDefault(); }
@@ -818,14 +1167,26 @@ document.addEventListener("keydown", e => {
   else if (isConfirm) { interact(); e.preventDefault(); }
 });
 
-/* ============ Input: pointer (mouse / touch) ============ */
+/* ============ Input: pointer (mouse / touch) — shown only after actual pointer use ============ */
 cv.addEventListener("pointerdown", e => {
   lastPointer = true;
   const p = toLogical(e);
   if (mode === "menu") { menuClick(p); return; }
   if (mode === "battle") {
+    if (battleItemsOpen) {
+      const list = battleItems();
+      for (let i = 0; i < list.length; i++) {
+        if (inRect(p, 8, 160 + i * 16, 384, 16)) {
+          if (battleItemCursor === i) useBattleItem(i);
+          else { battleItemCursor = i; draw(); }
+          return;
+        }
+      }
+      return;
+    }
     for (let i = 0; i < BCMDS.length; i++) {
-      if (inRect(p, BCMDS[i].x, 204, 120, 28)) {
+      const r = cmdRect(i);
+      if (inRect(p, r.x, r.y, r.w, r.h)) {
         if (battleCursor === i) battleCommand(BCMDS[i].id);
         else { battleCursor = i; draw(); }
         return;
@@ -836,9 +1197,9 @@ cv.addEventListener("pointerdown", e => {
   // map mode
   if (dialogActive()) {
     if (dialogChoices) {
-      // options are laid out from x=18; split the box into halves
-      const idx = p.x < W / 2 ? 0 : Math.min(1, dialogChoices.options.length - 1);
+      const n = dialogChoices.options.length;
       if (inRect(p, 8, 184, 384, 48)) {
+        const idx = Math.min(n - 1, Math.floor((p.x - 8) / 384 * n));
         if (dialogChoices.sel === idx) chooseDialogOption(idx);
         else { dialogChoices.sel = idx; draw(); }
       }
@@ -860,9 +1221,10 @@ cv.addEventListener("pointerdown", e => {
 (async () => {
   const loaded = await loadGame();
   if (loaded && loaded.map && MAPS[loaded.map]) {
-    S = Object.assign(freshState(), loaded);
+    S = migrateSave(loaded);
     if (S.secretOpen) setTile("cave", 1, 6, "P");
   }
+  playStart = Date.now();
   spawnEnemies();
   draw();
   showDialog([S.cleared ? "（セーブデータを読み込んだ。クリア済みの世界だ）" : "（セーブデータを読み込んだ／新しい冒険）"]);
