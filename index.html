@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-<title>maou-rpg v0.4</title>
+<title>maou-rpg v0.5</title>
 <style>
   html, body { margin:0; padding:0; background:#000; height:100%; overflow:hidden; }
   body { display:flex; align-items:center; justify-content:center; }
@@ -190,14 +190,15 @@ function isSolid(map, x, y) {
   return SOLID.indexOf(t) >= 0;
 }
 
-/* ============ Sheets (v0.4 vision) ============
+/* ============ Sheets (v0.4 vision, v0.5 rule) ============
    No radius/LOS/section vision anywhere: the village and field are fully
    visible, and in the cave/castle each map is ~70% visible with a few
    opaque cloth "sheets" (rectangles) hiding a dead end, the chest, the
-   stairs or the boss. A sheet opens permanently the moment the hero steps
-   onto a walkable tile inside it (including arriving there by stairs);
-   it never closes again during the adventure. Sheets have no collision
-   of their own and give no message when opened. The hidden wall is NOT
+   stairs or the boss. v0.5: a sheet's interior is visible ONLY while the
+   hero is inside that sheet; stepping out re-covers it. Visibility is
+   derived from the hero's current position every frame, so no opened
+   state is kept or saved at all. Sheets have no collision of their own
+   and give no message when they open or close. The hidden wall is NOT
    under a sheet: a sheet's existence is obvious, a secret passage's is not. */
 const SHEETS = [
   { id:"C1-A", map:"cave1",   x0:2, y0:1, x1:5,  y1:4 }, // west dead end (empty)
@@ -215,18 +216,15 @@ function sheetAt(map, x, y) {
   }
   return null;
 }
+/* The sheet the hero is currently standing in, or null. A sheet is open
+   exactly while this returns that sheet: arriving by stairs onto a tile
+   inside a sheet counts as inside, and stepping out closes it again on
+   that same move. */
+function currentSheet() { return sheetAt(S.map, S.x, S.y); }
+function isSheetOpen(sh) { return currentSheet() === sh; }
 function isCovered(map, x, y) {
   const sh = sheetAt(map, x, y);
-  return !!sh && S.openedSheets.indexOf(sh.id) < 0;
-}
-/* Called after every change of the hero's position (a step or a map
-   transfer): stepping onto a walkable tile inside a closed sheet opens it. */
-function checkSheets() {
-  const sh = sheetAt(S.map, S.x, S.y);
-  if (sh && S.openedSheets.indexOf(sh.id) < 0 && !isSolid(S.map, S.x, S.y)) {
-    S.openedSheets.push(sh.id);
-    saveQuiet();
-  }
+  return !!sh && !isSheetOpen(sh);
 }
 
 /* ============ State ============ */
@@ -236,17 +234,18 @@ function freshState() {
            herbs:1, water:0, hasSleepPowder:false,
            secretOpen:false, cleared:false,
            chestOpened:false, chestStage:0,
-           openedSheets:[],
            stats:{ wins:0, steps:0, deaths:0, elapsedMs:0 },
            clearRecord:null };
 }
-/* Migrate any older save (v0.1-v0.3 fields) to v0.4: missing fields get
-   defaults. A legacy save whose chest was already opened counts as
-   chest stage 1, so the sleep powder (stage 2) is still obtainable.
-   v0.4: old vision state is dropped, all sheets start closed, and a
-   position inside the old single cave/castle maps is moved to the new
-   sub-map arrival point (cave -> cave1 entrance, castle -> castle1 gate)
-   so the hero can never end up buried in a wall. */
+/* Migrate any older save (v0.1-v0.3 fields) to the current format:
+   missing fields get defaults. A legacy save whose chest was already
+   opened counts as chest stage 1, so the sleep powder (stage 2) is
+   still obtainable. v0.4: old vision state is dropped, and a position
+   inside the old single cave/castle maps is moved to the new sub-map
+   arrival point (cave -> cave1 entrance, castle -> castle1 gate) so
+   the hero can never end up buried in a wall. v0.5: a v0.4 save's
+   openedSheets field is simply discarded — sheet visibility is no
+   longer stored state. */
 function migrateSave(loaded) {
   const s = Object.assign(freshState(), loaded || {});
   if (!loaded || typeof loaded.chestStage !== "number") {
@@ -255,7 +254,7 @@ function migrateSave(loaded) {
   s.chestOpened = s.chestStage >= 1;
   if (typeof s.hasSleepPowder !== "boolean") s.hasSleepPowder = false;
   if (typeof s.water !== "number") s.water = 0;
-  if (!Array.isArray(s.openedSheets)) s.openedSheets = [];
+  delete s.openedSheets; // v0.4 field, ignored since v0.5
   if (s.map === "cave")   { s.map = "cave1";   s.x = 9; s.y = 7; }
   if (s.map === "castle") { s.map = "castle1"; s.x = 6; s.y = 5; }
   s.stats = Object.assign({ wins:0, steps:0, deaths:0, elapsedMs:0 }, (loaded && loaded.stats) || {});
@@ -346,10 +345,10 @@ async function deleteSave() {
   } catch (e) {}
 }
 
-/* ============ Vision (v0.4) ============
-   There is no visibility computation any more: every map renders in
-   full, except that unopened sheets in the cave/castle are drawn over
-   their rectangle (see SHEETS above and drawMap). */
+/* ============ Vision (v0.4, v0.5 rule) ============
+   There is no stored visibility state: every map renders in full,
+   except that sheets in the cave/castle are drawn over their rectangle
+   whenever the hero is not inside them (see SHEETS above and drawMap). */
 
 /* ============ Canvas setup: fixed 400x240 logical resolution ============ */
 const cv = document.getElementById("game"), ctx = cv.getContext("2d");
@@ -656,14 +655,15 @@ function drawMap() {
     if (mx < 0 || my < 0 || mx >= MAPS[S.map].w || my >= MAPS[S.map].h) continue; // out of map: dark
     drawTile(tileAt(S.map, mx, my), dx, dy, ts, pal, mx, my);
   }
-  // NPCs / enemies: never drawn while hidden under an unopened sheet
+  // NPCs / enemies: never drawn while hidden under a closed sheet
   MAPS[S.map].npcs.forEach(n => { if (!isCovered(S.map, n.x, n.y)) drawPerson(ctx, pox + (n.x - S.x) * ts, poy + (n.y - S.y) * ts, n.color, ts); });
   activeEnemies.forEach(e => { if (!e.inactive && !isCovered(S.map, e.x, e.y)) drawSprite(ctx, SPRITES[e.type], pox + (e.x - S.x) * ts, poy + (e.y - S.y) * ts, ts); });
-  // Unopened sheets: opaque dark blue-grey cloth with a lattice pattern.
+  // Closed sheets: opaque dark blue-grey cloth with a lattice pattern.
   // Drawn over terrain and objects, under the hero. No icon, no animation,
-  // and the chest's sheet looks exactly like every other sheet.
+  // and the chest's sheet looks exactly like every other sheet. A sheet is
+  // drawn only while the hero is NOT inside it (v0.5).
   for (const sh of SHEETS) {
-    if (sh.map !== S.map || S.openedSheets.indexOf(sh.id) >= 0) continue;
+    if (sh.map !== S.map || isSheetOpen(sh)) continue;
     const dx = pox + (sh.x0 - S.x) * ts, dy = poy + (sh.y0 - S.y) * ts;
     const sw = (sh.x1 - sh.x0 + 1) * ts, shh = (sh.y1 - sh.y0 + 1) * ts;
     ctx.fillStyle = "#293344"; ctx.fillRect(dx, dy, sw, shh);
@@ -718,7 +718,7 @@ const SCREEN_TITLES = { root:"メニュー", items:"どうぐ", status:"つよ�
 function drawMenu() {
   ctx.fillStyle = "#101018"; ctx.fillRect(0, 0, W, H);
   text(SCREEN_TITLES[menuScreen], 16, 12, 15);
-  text("v0.4", 384, 14, 9, "#888", "right");
+  text("v0.5", 384, 14, 9, "#888", "right");
   const list = currentList();
   const cur = menuCursors[menuScreen] || 0;
   list.forEach((item, i) => {
@@ -825,7 +825,7 @@ function goTo(map, x, y) {
   if (pg !== ng) for (const m in MAPS) if (groupOf(m) === ng) enemyStates[m] = freshEnemies(m);
   S.map = map; S.x = x; S.y = y;
   spawnEnemies();
-  checkSheets(); // arriving by stairs inside a sheet opens it too
+  // Sheet visibility follows the new position automatically (v0.5).
   saveQuiet(); draw();
 }
 /* Arrival positions are always a separate floor tile next to the
@@ -864,7 +864,7 @@ function tryMove(dir) {
   if (MAPS[S.map].npcs.some(n => n.x === nx && n.y === ny)) { draw(); return; }
   S.x = nx; S.y = ny;
   S.stats.steps++;
-  checkSheets(); // stepping into a sheet opens it before anything else happens there
+  // Sheet visibility follows the new position automatically (v0.5).
   const foe = enemyAt(nx, ny);
   if (foe) { startBattle(foe); draw(); return; }
   onStepTile(tileAt(S.map, nx, ny));
@@ -890,7 +890,7 @@ function interact() {
   if (mode !== "map") return;
   if (dialogActive()) { advanceDialog(); return; }
   const f = facingPos();
-  // Nothing under an unopened sheet can be examined from outside it:
+  // Nothing under a closed sheet can be examined from outside it:
   // no information leaks through the cloth.
   if (isCovered(S.map, f.x, f.y)) return;
   const npc = MAPS[S.map].npcs.find(n => n.x === f.x && n.y === f.y);
